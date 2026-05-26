@@ -38,7 +38,7 @@ echo ""
 check_endpoint "Agent"            "http://localhost:8080/health"
 check_endpoint "Orchestrator"     "http://localhost:8081/health"
 check_endpoint "Portal API"       "http://localhost:8082/health"
-check_endpoint "Portal UI"        "http://localhost:3000/"
+check_endpoint "Portal UI"        "http://localhost:3000/"        "307"
 check_endpoint "Prometheus"       "http://localhost:9090/prometheus/-/healthy"
 check_endpoint "Grafana"          "http://localhost:3001/api/health"
 
