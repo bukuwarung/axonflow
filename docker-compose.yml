@@ -1,0 +1,237 @@
+services:
+  postgres:
+    image: postgres:15-alpine
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: axonflow
+      POSTGRES_PASSWORD: "${AXONFLOW_DB_PASSWORD}"
+      POSTGRES_DB: axonflow
+    volumes:
+      - postgres-data:/var/lib/postgresql/data
+    ports:
+      - "127.0.0.1:5432:5432"
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U axonflow -d axonflow"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 30s
+    networks:
+      - axonflow-network
+
+  redis:
+    image: redis:7-alpine
+    restart: unless-stopped
+    ports:
+      - "127.0.0.1:6379:6379"
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    networks:
+      - axonflow-network
+
+  axonflow-agent:
+    image: ${AXONFLOW_REGISTRY}/axonflow-agent@${AGENT_DIGEST}
+    restart: unless-stopped
+    environment:
+      DATABASE_HOST: postgres
+      DATABASE_PORT: 5432
+      DATABASE_NAME: axonflow
+      DATABASE_USER: axonflow
+      DATABASE_PASSWORD: "${AXONFLOW_DB_PASSWORD}"
+      DATABASE_SSLMODE: disable
+      REDIS_URL: redis://redis:6379
+      PORT: 8080
+      DEPLOYMENT_MODE: enterprise
+      AXONFLOW_CLIENT_ID: "${AXONFLOW_ORG_ID}"
+      AXONFLOW_CLIENT_SECRET: "${AXONFLOW_LICENSE_KEY}"
+      ORG_ID: "${AXONFLOW_ORG_ID}"
+      AXONFLOW_VERSION: "${AXONFLOW_VERSION}"
+      AXONFLOW_DB_USE_APP_ROLE: "false"
+      ENVIRONMENT: production
+      LOG_LEVEL: info
+      OPENAI_API_KEY: "${OPENAI_API_KEY:-}"
+      ANTHROPIC_API_KEY: "${ANTHROPIC_API_KEY:-}"
+      GOOGLE_API_KEY: "${GOOGLE_API_KEY:-}"
+      SQLI_ACTION: block
+      PII_ACTION: redact
+      DANGEROUS_QUERY_ACTION: block
+    ports:
+      - "8080:8080"
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD-SHELL", "wget --no-verbose --tries=1 --spider http://localhost:8080/health || exit 1"]
+      interval: 10s
+      timeout: 5s
+      retries: 3
+      start_period: 30s
+    networks:
+      axonflow-network:
+        aliases:
+          - agent.axonflow.local
+
+  axonflow-orchestrator:
+    image: ${AXONFLOW_REGISTRY}/axonflow-orchestrator@${ORCHESTRATOR_DIGEST}
+    restart: unless-stopped
+    environment:
+      DATABASE_HOST: postgres
+      DATABASE_PORT: 5432
+      DATABASE_NAME: axonflow
+      DATABASE_USER: axonflow
+      DATABASE_PASSWORD: "${AXONFLOW_DB_PASSWORD}"
+      DATABASE_SSLMODE: disable
+      REDIS_URL: redis://redis:6379
+      PORT: 8081
+      DEPLOYMENT_MODE: enterprise
+      AXONFLOW_CLIENT_ID: "${AXONFLOW_ORG_ID}"
+      AXONFLOW_CLIENT_SECRET: "${AXONFLOW_LICENSE_KEY}"
+      ORG_ID: "${AXONFLOW_ORG_ID}"
+      AXONFLOW_VERSION: "${AXONFLOW_VERSION}"
+      AXONFLOW_DB_USE_APP_ROLE: "false"
+      AGENT_MCP_ENDPOINT: http://axonflow-agent:8080
+      LOG_LEVEL: info
+      OPENAI_API_KEY: "${OPENAI_API_KEY:-}"
+      ANTHROPIC_API_KEY: "${ANTHROPIC_API_KEY:-}"
+      GOOGLE_API_KEY: "${GOOGLE_API_KEY:-}"
+    ports:
+      - "8081:8081"
+    depends_on:
+      postgres:
+        condition: service_healthy
+      axonflow-agent:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD-SHELL", "wget --no-verbose --tries=1 --spider http://localhost:8081/health || exit 1"]
+      interval: 10s
+      timeout: 5s
+      retries: 3
+      start_period: 30s
+    networks:
+      axonflow-network:
+        aliases:
+          - orchestrator.axonflow.local
+
+  axonflow-customer-portal:
+    image: ${AXONFLOW_REGISTRY}/axonflow-customer-portal@${PORTAL_DIGEST}
+    restart: unless-stopped
+    environment:
+      DATABASE_HOST: postgres
+      DATABASE_PORT: 5432
+      DATABASE_NAME: axonflow
+      DATABASE_USER: axonflow
+      DATABASE_PASSWORD: "${AXONFLOW_DB_PASSWORD}"
+      DATABASE_SSLMODE: disable
+      ORG_ID: "${AXONFLOW_ORG_ID}"
+      TIER: Enterprise
+      PORT: 8080
+      LOG_LEVEL: info
+      AGENT_URL: http://axonflow-agent:8080
+      ORCHESTRATOR_URL: http://axonflow-orchestrator:8081
+      AXONFLOW_DB_USE_APP_ROLE: "false"
+    ports:
+      - "8082:8080"
+    depends_on:
+      axonflow-agent:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD-SHELL", "wget --no-verbose --tries=1 --spider http://localhost:8080/health || exit 1"]
+      interval: 10s
+      timeout: 5s
+      retries: 3
+      start_period: 30s
+    networks:
+      axonflow-network:
+        aliases:
+          - customer-portal.axonflow.local
+
+  axonflow-customer-portal-ui:
+    image: ${AXONFLOW_REGISTRY}/axonflow-customer-portal-ui@${PORTAL_UI_DIGEST}
+    restart: unless-stopped
+    environment:
+      API_BACKEND_URL: http://axonflow-customer-portal:8080
+    ports:
+      - "3000:3000"
+    depends_on:
+      axonflow-customer-portal:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD-SHELL", "wget --no-verbose --tries=1 --spider http://localhost:3000/ || exit 1"]
+      interval: 10s
+      timeout: 5s
+      retries: 3
+      start_period: 30s
+    networks:
+      - axonflow-network
+
+  axonflow-prometheus:
+    image: ${AXONFLOW_REGISTRY}/axonflow-prometheus@${PROMETHEUS_DIGEST}
+    restart: unless-stopped
+    environment:
+      STACK_NAME: axonflow
+    ports:
+      - "127.0.0.1:9090:9090"
+    depends_on:
+      axonflow-agent:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD-SHELL", "wget --no-verbose --tries=1 --spider http://localhost:9090/prometheus/-/healthy || exit 1"]
+      interval: 15s
+      timeout: 5s
+      retries: 5
+      start_period: 60s
+    volumes:
+      - prometheus-data:/prometheus
+    networks:
+      axonflow-network:
+        aliases:
+          - prometheus.axonflow.local
+
+  axonflow-grafana:
+    image: ${AXONFLOW_REGISTRY}/axonflow-grafana@${GRAFANA_DIGEST}
+    restart: unless-stopped
+    environment:
+      STACK_NAME: axonflow
+      GF_SECURITY_ADMIN_PASSWORD: "${GRAFANA_ADMIN_PASSWORD}"
+      DATABASE_HOST: postgres
+      DATABASE_PORT: 5432
+      DATABASE_NAME: axonflow
+      DATABASE_USER: axonflow
+      DATABASE_PASSWORD: "${AXONFLOW_DB_PASSWORD}"
+      DATABASE_SSLMODE: disable
+    ports:
+      - "127.0.0.1:3001:3000"
+    depends_on:
+      axonflow-prometheus:
+        condition: service_healthy
+      postgres:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD-SHELL", "wget --no-verbose --tries=1 --spider http://localhost:3000/api/health || exit 1"]
+      interval: 15s
+      timeout: 5s
+      retries: 5
+      start_period: 60s
+    volumes:
+      - grafana-data:/var/lib/grafana
+    networks:
+      - axonflow-network
+
+volumes:
+  postgres-data:
+    driver: local
+  prometheus-data:
+    driver: local
+  grafana-data:
+    driver: local
+
+networks:
+  axonflow-network:
+    driver: bridge
