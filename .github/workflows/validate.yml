@@ -1,0 +1,41 @@
+name: Validate install package
+
+on:
+  pull_request:
+  push:
+    branches:
+      - main
+
+jobs:
+  validate:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Validate shell scripts
+        run: |
+          bash -n install.sh
+          bash -n verify.sh
+
+      - name: Validate Docker Compose config
+        run: |
+          cat > .env.ci <<'EOF'
+          AXONFLOW_REGISTRY=ghcr.io/getaxonflow
+          AGENT_DIGEST=sha256:0000000000000000000000000000000000000000000000000000000000000000
+          ORCHESTRATOR_DIGEST=sha256:0000000000000000000000000000000000000000000000000000000000000000
+          PORTAL_DIGEST=sha256:0000000000000000000000000000000000000000000000000000000000000000
+          PORTAL_UI_DIGEST=sha256:0000000000000000000000000000000000000000000000000000000000000000
+          PROMETHEUS_DIGEST=sha256:0000000000000000000000000000000000000000000000000000000000000000
+          GRAFANA_DIGEST=sha256:0000000000000000000000000000000000000000000000000000000000000000
+          AXONFLOW_VERSION=8.3.0
+          AXONFLOW_DB_PASSWORD=ci-password
+          AXONFLOW_ORG_ID=ci-org
+          AXONFLOW_LICENSE_KEY=ci-license
+          OPENAI_API_KEY=
+          ANTHROPIC_API_KEY=
+          GOOGLE_API_KEY=
+          PII_ACTION=block
+          GRAFANA_ADMIN_PASSWORD=ci-grafana-password
+          EOF
+          docker compose --env-file .env.ci config --quiet
