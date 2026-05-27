@@ -56,7 +56,7 @@ services:
       ANTHROPIC_API_KEY: "${ANTHROPIC_API_KEY:-}"
       GOOGLE_API_KEY: "${GOOGLE_API_KEY:-}"
       SQLI_ACTION: block
-      PII_ACTION: redact
+      PII_ACTION: "${PII_ACTION:-block}"
       DANGEROUS_QUERY_ACTION: block
     ports:
       - "8080:8080"
