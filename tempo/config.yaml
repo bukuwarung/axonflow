@@ -1,0 +1,41 @@
+# Grafana Tempo - bundled install stack
+#
+# Single-tenant local-backend Tempo for Decision Mode trace visibility.
+# Storage is /var/tempo (volume-backed), so traces survive
+# `docker compose down` + `up -d`. `docker compose down -v` clears them.
+#
+# Eval-scoped retention: 24h block range. Production deployments should
+# replace the local backend with S3/GCS and tune compaction window.
+#
+# Shape derived from axonflow-enterprise/config/tempo-local.yaml (PR #2486),
+# adapted with persistent storage paths.
+
+server:
+  http_listen_port: 3200
+
+distributor:
+  receivers:
+    otlp:
+      protocols:
+        http:
+          endpoint: 0.0.0.0:4318
+        grpc:
+          endpoint: 0.0.0.0:4317
+
+storage:
+  trace:
+    backend: local
+    local:
+      path: /var/tempo/blocks
+    wal:
+      path: /var/tempo/wal
+    pool:
+      max_workers: 10
+      queue_depth: 100
+
+compactor:
+  compaction:
+    block_retention: 24h
+
+querier:
+  max_concurrent_queries: 20

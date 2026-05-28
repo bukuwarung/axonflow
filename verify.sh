@@ -38,13 +38,15 @@ echo ""
 check_endpoint "Agent"            "http://localhost:8080/health"
 check_endpoint "Orchestrator"     "http://localhost:8081/health"
 check_endpoint "Portal API"       "http://localhost:8082/health"
-check_endpoint "Portal UI"        "http://localhost:3000/"        "307"
+check_endpoint "Portal UI"        "http://localhost:3000/api/healthz"
 check_endpoint "Prometheus"       "http://localhost:9090/prometheus/-/healthy"
 check_endpoint "Grafana"          "http://localhost:3001/api/health"
+check_endpoint "OTel Collector"   "http://localhost:13133/"
+check_endpoint "Tempo"            "http://localhost:3200/ready"
 
 echo ""
 if [ "$FAILURES" -eq 0 ]; then
-  log "All 6 endpoints healthy."
+  log "All 8 endpoints healthy."
   exit 0
 else
   log "$FAILURES endpoint(s) failed. Check 'docker compose logs' for details."

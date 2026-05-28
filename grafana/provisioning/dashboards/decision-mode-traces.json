@@ -1,0 +1,52 @@
+{
+  "id": null,
+  "uid": "decision-mode-traces",
+  "title": "AxonFlow Decision Mode - Traces",
+  "tags": ["axonflow", "decision-mode", "otel", "tempo"],
+  "timezone": "utc",
+  "schemaVersion": 39,
+  "version": 1,
+  "refresh": "10s",
+  "time": {
+    "from": "now-1h",
+    "to": "now"
+  },
+  "templating": {
+    "list": []
+  },
+  "panels": [
+    {
+      "id": 1,
+      "title": "Recent Decision Mode traces",
+      "type": "table",
+      "gridPos": { "x": 0, "y": 0, "w": 24, "h": 14 },
+      "datasource": { "type": "tempo", "uid": "axonflow-tempo" },
+      "targets": [
+        {
+          "refId": "A",
+          "queryType": "traceqlSearch",
+          "datasource": { "type": "tempo", "uid": "axonflow-tempo" },
+          "filters": [
+            { "id": "service-name", "tag": "service.name", "operator": "=", "value": "axonflow-agent", "scope": "resource" }
+          ],
+          "limit": 100,
+          "tableType": "traces"
+        }
+      ],
+      "options": {
+        "showHeader": true
+      },
+      "description": "Most recent traces emitted by the axonflow-agent service. Decision Mode requests show up as spans named `axonflow.decision`. Click any row to open the trace detail view."
+    },
+    {
+      "id": 2,
+      "title": "How to read this dashboard",
+      "type": "text",
+      "gridPos": { "x": 0, "y": 14, "w": 24, "h": 6 },
+      "options": {
+        "mode": "markdown",
+        "content": "## Decision Mode traces (bundled install)\n\nEvery call to `POST /api/v1/decide` emits an OpenTelemetry span via the AxonFlow agent's Decision Mode tracer. Spans land in the bundled OTel collector and are stored in the bundled Tempo instance. Each span carries `decision.verdict`, `decision.stage`, `decision.id`, `decision.latency_ms`, `org.id`, and `tenant.id` as attributes - open any row in the table to see the full attribute set.\n\n**Why this matters for audit visibility:** the `GET /api/v1/ojk/dashboard` and `POST /api/v1/ojk/audit/export` endpoints index gateway/proxy traffic only. Decision Mode requests (the modern policy-decision path) need a trace backend, and that backend ships in this bundle as of v8.3.x.\n\n**Quick test:** from the host, send a Decision Mode request. Within ~10 seconds it appears in the trace table above.\n\n**Trace retention:** 24 hours (eval-scoped). For production-grade retention, point Tempo at S3/GCS."
+      }
+    }
+  ]
+}

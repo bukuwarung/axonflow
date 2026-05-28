@@ -71,6 +71,8 @@ REQUIRED_VARS=(
   AXONFLOW_DB_PASSWORD
   AXONFLOW_ORG_ID
   AXONFLOW_LICENSE_KEY
+  AXONFLOW_INTERNAL_SERVICE_SECRET
+  AXONFLOW_JWT_SECRET
   GRAFANA_ADMIN_PASSWORD
 )
 
@@ -178,11 +180,13 @@ log "  Agent API:        http://localhost:8080"
 log "  Orchestrator API: http://localhost:8081"
 log "  Customer Portal:  http://localhost:3000"
 log "  Grafana:          http://localhost:3001  (admin / your GRAFANA_ADMIN_PASSWORD)"
+log "  Decision traces:  http://localhost:3001/d/decision-mode-traces"
 echo ""
 log "Next steps:"
 log "  1. Open http://localhost:3000 in your browser"
 log "  2. Log in to Grafana at http://localhost:3001"
 log "  3. Send a test request — see the setup runbook for details"
+log "  4. Open the Decision Mode Traces dashboard to confirm spans land"
 echo ""
 log "To stop:  docker compose down"
 log "To reset: docker compose down -v  (removes all data)"

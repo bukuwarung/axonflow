@@ -1,0 +1,20 @@
+# Grafana Tempo datasource - bundled install stack
+#
+# Mounted into the bundled Grafana image at
+# /etc/grafana/provisioning/datasources/tempo.yaml. The bundled image's
+# entrypoint generates datasources.yaml at startup (Prometheus +
+# PostgreSQL); Grafana scans the whole directory, so this file lands
+# alongside without conflict.
+
+apiVersion: 1
+
+datasources:
+  - name: Tempo
+    type: tempo
+    uid: axonflow-tempo
+    access: proxy
+    url: http://tempo:3200
+    editable: false
+    jsonData:
+      nodeGraph:
+        enabled: true
