@@ -44,7 +44,8 @@ services:
       DATABASE_SSLMODE: disable
       REDIS_URL: redis://redis:6379
       PORT: 8080
-      DEPLOYMENT_MODE: enterprise
+      DEPLOYMENT_MODE: in-vpc-enterprise
+      AXONFLOW_LICENSE_KEY: "${AXONFLOW_LICENSE_KEY}"
       AXONFLOW_CLIENT_ID: "${AXONFLOW_ORG_ID}"
       AXONFLOW_CLIENT_SECRET: "${AXONFLOW_LICENSE_KEY}"
       ORG_ID: "${AXONFLOW_ORG_ID}"
@@ -88,7 +89,8 @@ services:
       DATABASE_SSLMODE: disable
       REDIS_URL: redis://redis:6379
       PORT: 8081
-      DEPLOYMENT_MODE: enterprise
+      DEPLOYMENT_MODE: in-vpc-enterprise
+      AXONFLOW_LICENSE_KEY: "${AXONFLOW_LICENSE_KEY}"
       AXONFLOW_CLIENT_ID: "${AXONFLOW_ORG_ID}"
       AXONFLOW_CLIENT_SECRET: "${AXONFLOW_LICENSE_KEY}"
       ORG_ID: "${AXONFLOW_ORG_ID}"
