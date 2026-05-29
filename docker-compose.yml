@@ -68,6 +68,7 @@ services:
 
   axonflow-agent:
     image: ${AXONFLOW_REGISTRY}/axonflow-agent@${AGENT_DIGEST}
+    platform: linux/amd64
     restart: unless-stopped
     environment:
       DATABASE_HOST: postgres
@@ -162,6 +163,7 @@ services:
 
   axonflow-orchestrator:
     image: ${AXONFLOW_REGISTRY}/axonflow-orchestrator@${ORCHESTRATOR_DIGEST}
+    platform: linux/amd64
     restart: unless-stopped
     environment:
       DATABASE_HOST: postgres
@@ -225,6 +227,7 @@ services:
 
   axonflow-customer-portal:
     image: ${AXONFLOW_REGISTRY}/axonflow-customer-portal@${PORTAL_DIGEST}
+    platform: linux/amd64
     restart: unless-stopped
     environment:
       DATABASE_HOST: postgres
@@ -268,6 +271,7 @@ services:
 
   axonflow-customer-portal-ui:
     image: ${AXONFLOW_REGISTRY}/axonflow-customer-portal-ui@${PORTAL_UI_DIGEST}
+    platform: linux/amd64
     restart: unless-stopped
     environment:
       API_BACKEND_URL: http://axonflow-customer-portal:8080
@@ -341,6 +345,7 @@ services:
 
   axonflow-prometheus:
     image: ${AXONFLOW_REGISTRY}/axonflow-prometheus@${PROMETHEUS_DIGEST}
+    platform: linux/amd64
     restart: unless-stopped
     environment:
       STACK_NAME: axonflow
@@ -367,6 +372,7 @@ services:
 
   axonflow-grafana:
     image: ${AXONFLOW_REGISTRY}/axonflow-grafana@${GRAFANA_DIGEST}
+    platform: linux/amd64
     restart: unless-stopped
     environment:
       STACK_NAME: axonflow
