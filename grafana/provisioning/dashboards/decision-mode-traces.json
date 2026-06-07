@@ -27,7 +27,7 @@
           "queryType": "traceqlSearch",
           "datasource": { "type": "tempo", "uid": "axonflow-tempo" },
           "filters": [
-            { "id": "service-name", "tag": "service.name", "operator": "=", "value": "axonflow-agent", "scope": "resource" }
+            { "id": "service-name", "tag": "service.name", "operator": "=", "value": "axonflow-agent", "scope": "resource", "valueType": "string" }
           ],
           "limit": 100,
           "tableType": "traces"

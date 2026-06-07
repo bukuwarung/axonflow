@@ -70,23 +70,23 @@ You can re-run the health check at any time:
 
 ### 5. First policy test
 
-Obtain an authentication token and send a test request through the gateway:
+AxonFlow authenticates with **HTTP Basic** auth — `base64(AXONFLOW_ORG_ID:AXONFLOW_LICENSE_KEY)`. There is no token-issuing endpoint.
+
+The simplest test is a Decision Mode call, which needs no user token:
 
 ```bash
-TOKEN=$(curl -s http://localhost:8080/v1/auth/token \
-  -H 'Content-Type: application/json' \
-  -d '{"client_id":"YOUR_ORG_ID","client_secret":"YOUR_LICENSE_KEY"}' | jq -r .token)
+source .env
+AUTH=$(printf '%s:%s' "$AXONFLOW_ORG_ID" "$AXONFLOW_LICENSE_KEY" | base64 | tr -d '\n')
 
-curl -s -X POST http://localhost:8080/v1/gateway \
-  -H "Content-Type: application/json" \
-  -H "Authorization: Bearer $TOKEN" \
-  -d '{
-    "model": "gpt-4o",
-    "messages": [{"role": "user", "content": "Hello, world"}]
-  }' | jq .
+curl -s -X POST http://localhost:8080/api/v1/decide \
+  -H "Authorization: Basic $AUTH" \
+  -H 'Content-Type: application/json' \
+  -d '{"stage":"llm","query":"Hello, world"}' | jq .
 ```
 
-The response includes policy decisions and audit metadata.
+The response includes the policy verdict (`allow` / `deny` / `needs_approval`) and audit metadata.
+
+> **Auth notes.** Endpoints that evaluate a specific end user (e.g. `POST /api/policy/pre-check`) additionally require a `user_token` — an HS256 JWT in the request body, signed with your `AXONFLOW_JWT_SECRET`, whose `tenant_id` claim equals the `AXONFLOW_ORG_ID` you authenticate with. A `401` means the JWT secret doesn't match `AXONFLOW_JWT_SECRET`; a `403 Tenant mismatch` means its `tenant_id` claim doesn't equal the Basic-auth username.
 
 ## Managing the Platform
 
