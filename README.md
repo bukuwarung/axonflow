@@ -70,23 +70,42 @@ You can re-run the health check at any time:
 
 ### 5. First policy test
 
-AxonFlow authenticates with **HTTP Basic** auth — `base64(AXONFLOW_ORG_ID:AXONFLOW_LICENSE_KEY)`. There is no token-issuing endpoint.
+> **⚠️ Requires the v8.5.1+ install bundle.** The dev-mode token endpoint below ships in the agent image for **v8.5.1 and later**. If `POST /api/v1/dev/token` returns `404` even in a `development` environment, your pinned `AGENT_DIGEST` predates v8.5.1 — use the v8.5.1+ digest set from your welcome bundle (or mint a `user_token` by hand, as described at the end of this section).
 
-The simplest test is a Decision Mode call, which needs no user token:
+> **For this evaluation quickstart, set `AXONFLOW_ENVIRONMENT=development` in your `.env`** (uncomment the line in `.env.example`, then `docker compose up -d`). That enables the agent's dev-mode token endpoint `POST /api/v1/dev/token`, so you can mint an evaluation `user_token` directly from your Basic credential — no hand-built JWTs, no `generate-jwt.sh`, no setting `tenant_id` twice. The value is fail-closed: leave it unset/`production` and the endpoint **returns `404` by design** — production mints `user_token`s from your own IdP/app, not from AxonFlow. Don't rely on `/api/v1/dev/token` existing in production.
+
+AxonFlow authenticates with **HTTP Basic** — `base64(AXONFLOW_ORG_ID:AXONFLOW_LICENSE_KEY)`. The full path is two calls:
 
 ```bash
 source .env
 AUTH=$(printf '%s:%s' "$AXONFLOW_ORG_ID" "$AXONFLOW_LICENSE_KEY" | base64 | tr -d '\n')
 
+# 1. Mint an evaluation user_token from your Basic credential. Its tenant_id is
+#    set automatically to your AXONFLOW_ORG_ID — a tenant mismatch is impossible.
+USER_TOKEN=$(curl -s -X POST http://localhost:8080/api/v1/dev/token \
+  -H "Authorization: Basic $AUTH" | jq -r .user_token)
+
+# 2. Run a policy pre-check with that token and read the verdict.
+curl -s -X POST http://localhost:8080/api/policy/pre-check \
+  -H "Authorization: Basic $AUTH" \
+  -H 'Content-Type: application/json' \
+  -d "{\"user_token\":\"$USER_TOKEN\",\"client_id\":\"$AXONFLOW_ORG_ID\",\"query\":\"Summarize the quarterly report\"}" | jq .
+```
+
+The pre-check response includes the policy verdict (`"approved": true` / `false`), the matched policies, and a `context_id` you can look up in the **Customer Portal → Decisions / Audit** view.
+
+You can also call **Decision Mode**, which needs no user token at all:
+
+```bash
 curl -s -X POST http://localhost:8080/api/v1/decide \
   -H "Authorization: Basic $AUTH" \
   -H 'Content-Type: application/json' \
   -d '{"stage":"llm","query":"Hello, world"}' | jq .
 ```
 
-The response includes the policy verdict (`allow` / `deny` / `needs_approval`) and audit metadata.
+The Decision Mode response includes the verdict (`allow` / `deny` / `needs_approval`) and audit metadata.
 
-> **Auth notes.** Endpoints that evaluate a specific end user (e.g. `POST /api/policy/pre-check`) additionally require a `user_token` — an HS256 JWT in the request body, signed with your `AXONFLOW_JWT_SECRET`, whose `tenant_id` claim equals the `AXONFLOW_ORG_ID` you authenticate with. A `401` means the JWT secret doesn't match `AXONFLOW_JWT_SECRET`; a `403 Tenant mismatch` means its `tenant_id` claim doesn't equal the Basic-auth username.
+> **What the dev-token endpoint does (and doesn't).** It mints a short-lived HS256 `user_token` signed with your `AXONFLOW_JWT_SECRET` and forces its `tenant_id` claim to equal your Basic-auth username — so the `403 Tenant mismatch` first-run error cannot happen on this path. It does **not** bypass license auth and **never** changes your `org_id`. It is registered **only** when `AXONFLOW_ENVIRONMENT` is an explicit non-production value (`development`, `dev`, `staging`, `local`); otherwise it returns `404`. To mint a token by hand instead (e.g. in production tooling), sign an HS256 JWT with `AXONFLOW_JWT_SECRET` whose `tenant_id` claim equals the Basic-auth username.
 
 ## Managing the Platform
 

@@ -86,7 +86,13 @@ services:
       ORG_ID: "${AXONFLOW_ORG_ID}"
       AXONFLOW_VERSION: "${AXONFLOW_VERSION}"
       AXONFLOW_DB_USE_APP_ROLE: "false"
-      ENVIRONMENT: production
+      # ENVIRONMENT gates dev-only conveniences on the agent. Default is
+      # `production` (fail-closed): the dev-mode token endpoint
+      # POST /api/v1/dev/token is NOT registered (→ 404). For an evaluation,
+      # set AXONFLOW_ENVIRONMENT=development in `.env` to enable that endpoint
+      # so the README "first policy test" works without hand-building a JWT.
+      # Leave it unset/production for any real deployment.
+      ENVIRONMENT: ${AXONFLOW_ENVIRONMENT:-production}
       # G5 — mirror CFN DEPLOYMENT_KIND. Safe to default to `production`
       # here (unlike the axonflow-enterprise canonical overlay) because
       # install.sh enforces a real AXONFLOW_ORG_ID at pre-flight, so the
