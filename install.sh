@@ -73,6 +73,7 @@ REQUIRED_VARS=(
   AXONFLOW_LICENSE_KEY
   AXONFLOW_INTERNAL_SERVICE_SECRET
   AXONFLOW_JWT_SECRET
+  AXONFLOW_PORTAL_ADMIN_PASSWORD
   GRAFANA_ADMIN_PASSWORD
 )
 
@@ -178,15 +179,16 @@ echo ""
 log "Quick reference:"
 log "  Agent API:        http://localhost:8080"
 log "  Orchestrator API: http://localhost:8081"
-log "  Customer Portal:  http://localhost:3000"
+log "  Customer Portal:  http://localhost:3000  (org: ${AXONFLOW_ORG_ID} / your AXONFLOW_PORTAL_ADMIN_PASSWORD)"
 log "  Grafana:          http://localhost:3001  (admin / your GRAFANA_ADMIN_PASSWORD)"
 log "  Decision traces:  http://localhost:3001/d/decision-mode-traces"
 echo ""
 log "Next steps:"
-log "  1. Open http://localhost:3000 in your browser"
+log "  1. Open http://localhost:3000 and log in — org: ${AXONFLOW_ORG_ID}, password: your AXONFLOW_PORTAL_ADMIN_PASSWORD"
 log "  2. Log in to Grafana at http://localhost:3001"
 log "  3. Send a test request — see the setup runbook for details"
 log "  4. Open the Decision Mode Traces dashboard to confirm spans land"
+log "  Lost the portal password? Run ./reset-portal-credential.sh"
 echo ""
 log "To stop:  docker compose down"
 log "To reset: docker compose down -v  (removes all data)"

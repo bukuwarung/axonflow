@@ -13,16 +13,20 @@ set -uo pipefail
 #   4. POST /api/v1/decide records a decision.
 #   5. The decision is visible via GET /api/v1/decisions (the data the Customer
 #      Portal "Decisions" view renders).
-#   6. Fail-closed gate: an agent booted with ENVIRONMENT=production returns 404
+#   6. Portal login: POST /api/v1/auth/login with ORG_ID + AXONFLOW_PORTAL_ADMIN_PASSWORD
+#      returns 200 + a session — the deployment-org credential auto-provisioned
+#      at first boot (#2552), so the portal is loginable out-of-box.
+#   7. Fail-closed gate: an agent booted with ENVIRONMENT=production returns 404
 #      for /api/v1/dev/token — so the smoke documents the gate too.
 #
 # Run it from the install directory after `./install.sh`. Requires: docker, jq,
-# curl. Reads org/license/jwt from `.env`.
+# curl. Reads org/license/jwt/portal-password from `.env`.
 #
 # Env overrides (defaults target the bundled stack):
 #   AGENT_URL   (http://localhost:8080)   ORCH_URL (http://localhost:8081)
-#   AGENT_CONTAINER (auto-detected)       SMOKE_DB_HOST (postgres)
-#   SKIP_PROD_CHECK=1  → skip step 6 (NOT recommended; it proves fail-closed)
+#   PORTAL_URL  (http://localhost:8082)   SMOKE_DB_HOST (postgres)
+#   AGENT_CONTAINER (auto-detected)
+#   SKIP_PROD_CHECK=1  → skip step 7 (NOT recommended; it proves fail-closed)
 
 ok()   { printf '  \033[1;32m✓\033[0m %s\n' "$*"; }
 bad()  { printf '  \033[1;31m✗\033[0m %s\n' "$*"; FAILURES=$((FAILURES + 1)); }
@@ -31,6 +35,7 @@ FAILURES=0
 
 AGENT_URL="${AGENT_URL:-http://localhost:8080}"
 ORCH_URL="${ORCH_URL:-http://localhost:8081}"
+PORTAL_URL="${PORTAL_URL:-http://localhost:8082}"
 SMOKE_DB_HOST="${SMOKE_DB_HOST:-postgres}"
 
 # --- load credentials from .env -------------------------------------------
@@ -103,9 +108,28 @@ if [ -n "${DID:-}" ]; then
   fi
 fi
 
-# --- 6. fail-closed gate: an ENVIRONMENT=production agent returns 404 ------
+# --- 6. portal login with the auto-provisioned deployment-org credential ---
+# #2552: an enterprise/in-vpc install bootstraps the portal password for ORG_ID
+# from AXONFLOW_PORTAL_ADMIN_PASSWORD at first boot — so an out-of-box login must
+# succeed with no manual SQL. This is the data the Customer Portal sign-in uses.
+PORTAL_PW="${AXONFLOW_PORTAL_ADMIN_PASSWORD:-}"
+if [ -z "$PORTAL_PW" ]; then
+  bad "AXONFLOW_PORTAL_ADMIN_PASSWORD not set (source .env) — cannot verify the auto-provisioned portal login"
+else
+  lcode=$(curl -s -o "$WORK/login.json" -w '%{http_code}' -X POST "$PORTAL_URL/api/v1/auth/login" \
+    -H 'Content-Type: application/json' \
+    -d "{\"org_id\":\"$ORG\",\"password\":$(printf '%s' "$PORTAL_PW" | jq -Rs .)}")
+  SID=$(jq -r '.session_id // empty' < "$WORK/login.json" 2>/dev/null)
+  if [ "$lcode" = "200" ] && [ -n "$SID" ]; then
+    ok "portal login (org=$ORG) → 200 + session (auto-provisioned credential, #2552)"
+  else
+    bad "portal login (org=$ORG) → HTTP $lcode without a session_id (expected 200). The deployment-org credential should be auto-provisioned at first boot."; sed 's/^/      /' "$WORK/login.json" 2>/dev/null || true
+  fi
+fi
+
+# --- 7. fail-closed gate: an ENVIRONMENT=production agent returns 404 ------
 if [ "${SKIP_PROD_CHECK:-0}" = "1" ]; then
-  log "step 6 (prod-404) skipped via SKIP_PROD_CHECK=1"
+  log "step 7 (prod-404) skipped via SKIP_PROD_CHECK=1"
 else
   CONTAINER="${AGENT_CONTAINER:-$(docker ps --filter 'name=axonflow-agent' --format '{{.Names}}' 2>/dev/null | head -1)}"
   if [ -z "$CONTAINER" ] || ! command -v docker >/dev/null 2>&1; then

@@ -255,6 +255,12 @@ services:
       ADMIN_API_KEY: "${ADMIN_API_KEY:-}"
       # G1 — must match agent's value for HMAC verification when portal calls agent
       AXONFLOW_INTERNAL_SERVICE_SECRET: "${AXONFLOW_INTERNAL_SERVICE_SECRET}"
+      # #2552 — bootstrap the deployment org's portal login password on first
+      # boot. In in-vpc-enterprise mode the portal REQUIRES this (fail-closed:
+      # it refuses to start if unset), so the operator can log into the portal
+      # with org=ORG_ID + this password without any manual SQL. No-clobber on
+      # restart once the password is changed.
+      AXONFLOW_PORTAL_ADMIN_PASSWORD: "${AXONFLOW_PORTAL_ADMIN_PASSWORD}"
     ports:
       - "127.0.0.1:8082:8080"
     depends_on:

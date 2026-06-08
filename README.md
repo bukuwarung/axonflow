@@ -40,12 +40,13 @@ Open `.env` and fill in the values from your welcome bundle:
 - Paste the 6 image digests matching your chosen registry
 - Set your database and Grafana passwords
 - Set your organization ID and license key
+- Set `AXONFLOW_PORTAL_ADMIN_PASSWORD` — your Customer Portal login password
 - Add at least one LLM provider API key
 
 ### 3. Install
 
 ```bash
-chmod +x install.sh verify.sh
+chmod +x install.sh verify.sh reset-portal-credential.sh
 ./install.sh
 ```
 
@@ -61,6 +62,21 @@ Once the install script completes, all services are running:
 | Orchestrator API | http://localhost:8081 | Policy management and LLM routing |
 | Customer Portal | http://localhost:3000 | Web dashboard for policies, audit trails, approvals |
 | Grafana | http://localhost:3001 | Metrics dashboard (login: admin / your password) |
+
+**Log into the Customer Portal** at http://localhost:3000 with:
+
+- **Org:** your `AXONFLOW_ORG_ID`
+- **Password:** your `AXONFLOW_PORTAL_ADMIN_PASSWORD`
+
+This login is provisioned automatically on first boot — no manual setup. Once
+you change the password (in the portal or with the recovery script below) the
+new password sticks; the env var no longer overwrites it.
+
+Lost the portal password? Reset it without losing data:
+
+```bash
+./reset-portal-credential.sh        # prompts for a new password
+```
 
 You can re-run the health check at any time:
 
