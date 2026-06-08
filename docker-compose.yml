@@ -253,6 +253,14 @@ services:
       DEPLOYMENT_MODE: in-vpc-enterprise
       ENVIRONMENT: production
       ADMIN_API_KEY: "${ADMIN_API_KEY:-}"
+      # Session-cookie Secure attribute. The portal binary defaults this to
+      # true (HTTPS/prod). This install bundle serves the portal over plain
+      # HTTP, where the browser silently drops a Secure cookie → every authed
+      # portal request 401s ("no session") and the dashboard falls back to a
+      # placeholder license. Set false so the HTTP eval flow works.
+      # SECURITY: only acceptable on a trusted internal network / eval. If you
+      # expose the portal beyond localhost, front it with TLS and remove this.
+      AXONFLOW_PORTAL_COOKIE_SECURE: "false"
       # G1 — must match agent's value for HMAC verification when portal calls agent
       AXONFLOW_INTERNAL_SERVICE_SECRET: "${AXONFLOW_INTERNAL_SERVICE_SECRET}"
       # #2552 — bootstrap the deployment org's portal login password on first
