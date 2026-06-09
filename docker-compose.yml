@@ -111,7 +111,9 @@ services:
       ANTHROPIC_API_KEY: "${ANTHROPIC_API_KEY:-}"
       GOOGLE_API_KEY: "${GOOGLE_API_KEY:-}"
       SQLI_ACTION: block
-      PII_ACTION: "${PII_ACTION:-block}"
+      # Default redact = mask-and-forward (chat-friendly). Set PII_ACTION=block
+      # in .env for regulated/batch deployments that must hard-stop on PII.
+      PII_ACTION: "${PII_ACTION:-redact}"
       DANGEROUS_QUERY_ACTION: block
       # GRAFANA_PASSWORD — consumed by migration 028 (template
       # substitution for the `grafana` Postgres user the bundled
