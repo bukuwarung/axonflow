@@ -136,6 +136,12 @@ docker compose down
 docker compose down -v
 ```
 
+## Upgrading
+
+To move to a new AxonFlow release, swap the image digest set in your `.env` and
+restart — there is no reinstall and your data is preserved. See
+**[UPGRADING.md](UPGRADING.md)** for the step-by-step guide.
+
 ## Troubleshooting
 
 | Symptom | Fix |
