@@ -115,6 +115,13 @@ services:
       # in .env for regulated/batch deployments that must hard-stop on PII.
       PII_ACTION: "${PII_ACTION:-redact}"
       DANGEROUS_QUERY_ACTION: block
+      # Identity-header trust gate (v9.8.1+) — set
+      # AXONFLOW_TRUST_IDENTITY_HEADERS=true in .env for per-user audit
+      # attribution, ONLY if your identity source is trusted (managed
+      # settings / MDM, desktop proxy configuration, or gateway auth
+      # claims). Agent-only knob; default false = headers ignored (secure
+      # default). See .env.example for the full trust caveat.
+      AXONFLOW_TRUST_IDENTITY_HEADERS: "${AXONFLOW_TRUST_IDENTITY_HEADERS:-false}"
       # GRAFANA_PASSWORD — consumed by migration 028 (template
       # substitution for the `grafana` Postgres user the bundled
       # axonflow-grafana image authenticates as). Re-uses the same

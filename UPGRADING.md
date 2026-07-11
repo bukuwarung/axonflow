@@ -56,6 +56,17 @@ rollback is exact. This is safe for an **additive patch** release. A **minor or
 major** release may run forward database migrations that are not automatically
 reversed — contact support@getaxonflow.com before rolling one of those back.
 
+## Version-specific notes
+
+- **v9.8.1+ — per-user audit attribution:** to keep (or enable) per-user audit
+  attribution from developer identity headers, set
+  `AXONFLOW_TRUST_IDENTITY_HEADERS=true` in `.env` (agent-only; see the trust
+  caveat in `.env.example`). The default is `false`: the agent ignores
+  client-asserted identity headers and attributes audit rows to the fleet
+  identity, logging a detection warning when a caller sends them. Set `true`
+  only if your developers' identity comes from a trusted source (managed
+  settings / MDM, the Claude Desktop proxy, or a gateway auth claim).
+
 ## Need help?
 
 Email support@getaxonflow.com (24-hour response for evaluation partners), or see
