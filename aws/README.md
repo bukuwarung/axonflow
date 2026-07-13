@@ -116,7 +116,8 @@ Then deploy with:
 | `RegistryCredentialsSecretArn` | Secrets Manager ARN of `{"username","password"}` for GHCR-direct; **empty** for ECR. |
 | `AgentImageTag` … `GrafanaImageTag` | v-prefixed release image tag (e.g. `v9.9.0`). Default `v9.9.0`. Release images are published v-prefixed. |
 | `AgentDesiredCount`, `OrchestratorDesiredCount` | Replica counts. The agent is replica-interchangeable; the orchestrator is a required service. |
-| `CustomerPortalDesiredCount`, `CustomerPortalUIDesiredCount` | Set to `0` to disable. |
+| `DeploymentMode` | `in-vpc-enterprise` (default, single-tenant in your VPC) — also enables the portal admin bootstrap. |
+| `CustomerPortalDesiredCount`, `CustomerPortalUIDesiredCount` | The governance console. Deployed by default (`1`); set to `0` only if you do not want the console. |
 | `DeployPrometheus`, `DeployGrafana` | Optional monitoring. |
 | `LoadBalancerScheme` | `internal` (default) or `internet-facing`. |
 | `DomainName` / `CertificateArn` | Optional HTTPS. |
@@ -186,6 +187,42 @@ aws ecs describe-services --region "$REGION" --cluster "$CLUSTER" \
 
 ---
 
+## First login to the admin console
+
+The customer portal is deployed by default and is loginable out-of-box — no
+manual seeding. On first boot the portal creates the deployment organization and
+seeds an admin password (generated at deploy time). The stack never exposes the
+password itself, only the ARN of the Secrets Manager secret that holds it.
+
+1. Read the login identity and the password-secret ARN from the stack outputs:
+
+   ```bash
+   aws cloudformation describe-stacks --region "$REGION" --stack-name axonflow-prod \
+     --query 'Stacks[0].Outputs[?OutputKey==`PortalAdminOrgId` || OutputKey==`PortalAdminPasswordSecretArn`].[OutputKey,OutputValue]' \
+     --output table
+   ```
+
+   `PortalAdminOrgId` is your login identity (the deployment `org_id`);
+   `PortalAdminPasswordSecretArn` is the secret holding the initial password.
+
+2. Retrieve the initial password:
+
+   ```bash
+   aws secretsmanager get-secret-value --region "$REGION" \
+     --secret-id <PortalAdminPasswordSecretArn> --query SecretString --output text
+   ```
+
+3. Log in at the portal UI (or `POST /api/v1/auth/login` with
+   `{"org_id":"<PortalAdminOrgId>","password":"<the password>"}`) and **change
+   the password on first login**.
+
+The seed is idempotent and never overwrites a password you have changed. If you
+ever need to reset it out of band, use `reset-portal-credential.sh` (at the
+repository root), e.g.
+`DATABASE_URL="postgres://…" ../reset-portal-credential.sh --org <PortalAdminOrgId>`.
+
+---
+
 ## Upgrade
 
 For the mirror-to-ECR path, `upgrade.sh` mirrors the new version, flips only the
@@ -203,6 +240,11 @@ services stay in lock-step.
 
 For the GHCR-direct path, upgrade by running `update-stack` with the new image
 tags (and `RegistryCredentialsSecretArn` unchanged).
+
+> On a manual `aws cloudformation update-stack`, pass your existing
+> `DeploymentMode` explicitly (or use `upgrade.sh`, which preserves it via
+> `UsePreviousValue`) — omitting it resets `DeploymentMode` to the template
+> default and can silently flip an existing stack's mode.
 
 ---
 

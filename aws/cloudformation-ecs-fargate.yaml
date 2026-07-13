@@ -15,7 +15,7 @@
 # health verification, and the mirror-to-ECR upgrade path).
 # ============================================================================
 AWSTemplateFormatVersion: '2010-09-09'
-Description: 'AxonFlow AI Governance Platform v9.9.0 - ECS/Fargate Deployment with Optional Monitoring (partner-ready: private-registry pull via RegistryCredentialsSecretArn, or ECR/execution-role pull when unset)'
+Description: 'AxonFlow AI Governance Platform v9.9.0 - ECS/Fargate Deployment with Optional Monitoring (partner-ready: private-registry pull via RegistryCredentialsSecretArn, or ECR/execution-role pull when unset). Customer-portal is deployed by default and loginable out-of-box: admin login = the deployment org_id (PortalAdminOrgId output); retrieve the initial password from the PortalAdminPasswordSecretArn output via aws secretsmanager get-secret-value, then change it on first login.'
 
 # ========================================
 # VPC INFRASTRUCTURE REQUIREMENTS
@@ -353,10 +353,10 @@ Parameters:
   # parameter. It is baked into the agent and orchestrator container images
   # at build time as ENV AXONFLOW_VERSION, sourced from the repo-root
   # `VERSION` file via the Dockerfile's ARG/ENV pair (see Dockerfile + the
-  # `--build-arg AXONFLOW_VERSION=$(cat VERSION)` step in build.yml). The
+  # `--build-arg AXONFLOW_VERSION=$(cat VERSION)` build step). The
   # image-baked ENV is the single source of truth — bumping the deployed
   # /health version is now handled by deploying a new image, not by
-  # updating a CFN parameter. This keeps platform_version, capabilities.go,
+  # updating a CFN parameter. This keeps platform_version, the capabilities manifest,
   # SDK floors, and the deployed binary in lock-step every release.
 
   AgentImageTag:
@@ -426,13 +426,13 @@ Parameters:
     Description: |
       Base URL for the Customer Portal API backend.
       The UI will make API calls to this URL.
-      Example: https://staging-eu.getaxonflow.com:8090
+      Example: https://governance.yourcompany.com:8090
     Default: ''
 
   DomainName:
     Type: String
     Description: |
-      (Optional) Domain name for HTTPS access (e.g., staging-eu.getaxonflow.com).
+      (Optional) Domain name for HTTPS access (e.g., governance.yourcompany.com).
       If provided, an ACM certificate will be automatically created and validated via DNS.
       You must add the DNS validation CNAME record to your DNS provider.
       Leave empty if providing your own CertificateArn.
@@ -473,7 +473,11 @@ Parameters:
       - in-vpc-healthcare
       - in-vpc-banking
       - invpc
-    Default: saas
+    # Default to single-tenant in-VPC enterprise: this template is deployed by a
+    # customer into their own VPC. This mode also enables the customer-portal's
+    # first-boot admin bootstrap (org row + admin password), so a fresh stack is
+    # loginable out-of-box. Use 'saas' only for multi-tenant hosting.
+    Default: in-vpc-enterprise
     ConstraintDescription: Must be a valid deployment mode (saas, in-vpc-enterprise, in-vpc-healthcare, in-vpc-banking, or invpc for legacy)
 
   OrganizationID:
@@ -838,8 +842,8 @@ Parameters:
   # Per-category action knobs (block / warn / log / redact). Empty value
   # leaves the running profile's defaults in place — set explicitly when
   # the deployment needs a category to behave differently from the active
-  # AXONFLOW_PROFILE. Maps 1:1 to the env vars consumed by
-  # platform/agent/detection_config.go (EnvSQLIAction etc.).
+  # AXONFLOW_PROFILE. Maps 1:1 to the agent's detection-configuration env
+  # vars (SQLI/PII/sensitive-data/dangerous-query action).
 
   SQLIAction:
     Type: String
@@ -897,7 +901,7 @@ Parameters:
   # ========================================
   # Article-14 production defaults: 10 errors / 20 policy violations per
   # 5-min window per client. Empty leaves those defaults in place; explicit
-  # values override via env vars consumed in platform/agent/run.go.
+  # values override via env vars consumed by the agent at startup.
   # Benchmark stacks set these high so sustained attack-pattern load
   # doesn't pre-empt requests after the first second.
 
@@ -2280,6 +2284,7 @@ Resources:
                   - !Ref JWTSecret
                   - !Ref LLMKeysSecret
                   - !Ref AdminAPIKeySecret
+                  - !Ref PortalAdminPasswordSecret
                   # Grant access to all connector and LLM credentials in Secrets Manager.
                   # Supports: Amadeus, Salesforce, Slack, Snowflake, Client LLMs, AxonFlow LLMs.
                   #
@@ -2464,7 +2469,7 @@ Resources:
 
   # Admin API key for the customer-portal admin endpoints.
   # Read into the customer-portal container as ADMIN_API_KEY env var; the
-  # admin-auth middleware in ee/platform/customer-portal/middleware/admin_auth.go
+  # customer-portal admin-auth middleware
   # requires this header on /api/v1/admin/* calls when DEPLOYMENT_MODE=saas
   # and ENVIRONMENT=production. Auto-generated 64-char alphanumeric — long
   # enough that subtle.ConstantTimeCompare gives a meaningful security
@@ -2485,6 +2490,31 @@ Resources:
       Tags:
         - Key: Name
           Value: !Sub '${AWS::StackName}-admin-api-key'
+
+  # Initial customer-portal admin login password. Auto-generated so a fresh
+  # deployment is loginable out-of-box without any plaintext credential in the
+  # template, parameters, or stack outputs. Injected into the customer-portal
+  # container as AXONFLOW_PORTAL_ADMIN_PASSWORD (see below); on first boot the
+  # portal creates the deployment org row and seeds this password (bcrypt),
+  # idempotently and without clobbering a password an admin later changes. The
+  # ARN — not the value — is exposed in the stack Outputs; retrieve the value
+  # with `aws secretsmanager get-secret-value`. 24 chars keeps it well within
+  # the portal's 8..72-char bootstrap validation.
+  PortalAdminPasswordSecret:
+    Type: AWS::SecretsManager::Secret
+    Properties:
+      Name: !Sub '${AWS::StackName}-portal-admin-password'
+      Description: Initial customer-portal admin login password (bootstrap; change on first login)
+      KmsKeyId: alias/aws/secretsmanager
+      GenerateSecretString:
+        ExcludePunctuation: true
+        ExcludeUppercase: false
+        IncludeSpace: false
+        PasswordLength: 24
+        ExcludeCharacters: '"@/\'
+      Tags:
+        - Key: Name
+          Value: !Sub '${AWS::StackName}-portal-admin-password'
 
   # ========================================
   # License Key Generation Lambda
@@ -2885,7 +2915,7 @@ Resources:
               Value: !Ref TrustIdentityHeaders
 
             # Detection action overrides (only emitted when set; consumed by
-            # platform/agent/detection_config.go DetectionConfigFromEnvWithBase).
+            # the agent's detection configuration at startup).
             - !If
               - HasSQLIAction
               - Name: SQLI_ACTION
@@ -2908,7 +2938,7 @@ Resources:
               - !Ref AWS::NoValue
 
             # Circuit breaker threshold overrides (only emitted when set;
-            # consumed by platform/agent/run.go envIntDefault at startup).
+            # consumed by the agent at startup).
             - !If
               - HasCBErrorThreshold
               - Name: AXONFLOW_CB_ERROR_THRESHOLD
@@ -3119,6 +3149,21 @@ Resources:
             - Name: TIER
               Value: !Ref PricingTier
 
+            # v9 RLS — phased rollout safety hatch. Same logic as the agent and
+            # orchestrator task defs: when AppRoleProvisioned=false the portal
+            # binary would otherwise default UseAppRoleEnabled() to TRUE, assert
+            # current_user=axonflow_app_role, and crash-loop because only the
+            # master DSN exists. The explicit 'false' override keeps it on the
+            # master DSN until the app-role provisioning step flips
+            # AppRoleProvisioned=true, at which point this becomes AWS::NoValue
+            # and the AXONFLOW_DB_APP_ROLE_URL / _PLATFORM_ADMIN_URL Secret-refs
+            # below take over.
+            - !If
+              - AppRoleProvisionedTrue
+              - !Ref AWS::NoValue
+              - Name: AXONFLOW_DB_USE_APP_ROLE
+                Value: 'false'
+
             # Deployment Mode (SaaS vs In-VPC)
             - Name: DEPLOYMENT_MODE
               Value: !Ref DeploymentMode
@@ -3144,8 +3189,7 @@ Resources:
               ValueFrom: !Sub '${DBPasswordSecret}:password::'
 
             # v9 RLS — customer portal reads AXONFLOW_DB_PLATFORM_ADMIN_URL
-            # at startup (ee/platform/customer-portal/main.go:80, via os.Getenv +
-            # sql.Open) to open a separate BYPASSRLS admin DB used by cross-org
+            # at startup to open a separate BYPASSRLS admin DB used by cross-org
             # admin handlers + pre-auth SSO cookie lookups. Wire both secrets so
             # portal handlers honor FORCE RLS post-flip.
             - !If
@@ -3165,11 +3209,18 @@ Resources:
             # view hides every system policy because the agent 401s the call.
             - Name: AXONFLOW_INTERNAL_SERVICE_SECRET
               ValueFrom: !Ref InternalServiceSecret
-            # Admin API key consumed by ee/platform/customer-portal/middleware/admin_auth.go
+            # Admin API key consumed by the customer-portal admin-auth middleware.
             # When ENVIRONMENT=production this is required; in other modes
             # the middleware still respects it as optional auth.
             - Name: ADMIN_API_KEY
               ValueFrom: !Ref AdminAPIKeySecret
+            # Bootstrap admin login password. On first boot (when
+            # DEPLOYMENT_MODE is enterprise / in-vpc-*) the portal creates the
+            # deployment org row and seeds this as the admin password (bcrypt),
+            # idempotent and no-clobber. Auto-generated secret; retrieve the
+            # value from the PortalAdminPasswordSecretArn stack output.
+            - Name: AXONFLOW_PORTAL_ADMIN_PASSWORD
+              ValueFrom: !Ref PortalAdminPasswordSecret
 
           LogConfiguration:
             LogDriver: awslogs
@@ -3222,12 +3273,21 @@ Resources:
             # This is the ALB endpoint for the Customer Portal API (port 8090)
             # IMPORTANT: When DomainName is provided, use the vanity domain instead of ALB DNS
             # This is required because Node.js fetch validates TLS certificates and the ALB certificate
-            # is issued for the DomainName (e.g., staging-eu.getaxonflow.com), not the ALB DNS name
+            # is issued for the DomainName (e.g., governance.yourcompany.com), not the ALB DNS name
+            # Scheme must follow the ALB's actual listener protocol: when no
+            # certificate/domain is configured the ALB serves the portal API on
+            # 8090 over HTTP, so an https:// backend URL fails the Next.js proxy
+            # with a TLS "wrong version number" error and the UI login returns
+            # "Something went wrong on the server". Only use https:// when HTTPS
+            # is actually enabled.
             - Name: API_BACKEND_URL
               Value: !If
-                - HasDomainName
-                - !Sub 'https://${DomainName}:8090'
-                - !Sub 'https://${AxonFlowALB.DNSName}:8090'
+                - UseHTTPS
+                - !If
+                  - HasDomainName
+                  - !Sub 'https://${DomainName}:8090'
+                  - !Sub 'https://${AxonFlowALB.DNSName}:8090'
+                - !Sub 'http://${AxonFlowALB.DNSName}:8090'
             # DEPRECATED: NEXT_PUBLIC_API_BASE_URL was used for build-time API configuration
             # Keeping for backward compatibility but new deployments should use API_BACKEND_URL
             - Name: NEXT_PUBLIC_API_BASE_URL
@@ -3255,7 +3315,7 @@ Resources:
     Type: AWS::ECS::TaskDefinition
     # Same dependency as AgentTaskDefinition — both containers must see
     # the real license, not the placeholder. The orchestrator's license
-    # validation path (platform/orchestrator/run.go) fail-fasts on the
+    # validation path fail-fasts on the
     # same org_id mismatch the agent does, so the race window covered by
     # the AgentTaskDefinition DependsOn also applies here.
     DependsOn:
@@ -3358,14 +3418,12 @@ Resources:
             - Name: MEDIA_GOVERNANCE_ENABLED
               Value: !Ref MediaGovernanceEnabled
 
-            # Detection action overrides (only emitted when set; consumed by
-            # platform/agent/detection_config.go which both the agent AND the
-            # orchestrator import — orchestrator/run.go calls
-            # DetectionConfigFromEnv at startup and orchestrator/dynamic_policy_engine.go
-            # + response_processor.go read the same env vars during request
-            # evaluation, so the orchestrator MUST receive the same overrides
-            # as the agent or the two will diverge in their PII / SQLi /
-            # sensitive-data / dangerous-query enforcement.
+            # Detection action overrides (only emitted when set). The same
+            # detection configuration is shared by the agent AND the
+            # orchestrator, which both read these env vars at startup and during
+            # request evaluation, so the orchestrator MUST receive the same
+            # overrides as the agent or the two will diverge in their PII / SQLi
+            # / sensitive-data / dangerous-query enforcement.
             - !If
               - HasSQLIAction
               - Name: SQLI_ACTION
@@ -3394,7 +3452,7 @@ Resources:
               ValueFrom: !Sub '${DBPasswordSecret}:password::'
 
             # v9 RLS — orchestrator picks up app_role + platform_admin
-            # DSNs the same way the agent does (db_connection.go is shared plumbing).
+            # DSNs the same way the agent does (shared DB plumbing).
             - !If
               - AppRoleProvisionedWithSecrets
               - Name: AXONFLOW_DB_APP_ROLE_URL
@@ -4516,6 +4574,25 @@ Resources:
           Input: !Sub '{"containerOverrides": [{"name": "performance-testing", "environment": [{"name": "TEST_MODE", "value": "weekly"}]}]}'
 
 Outputs:
+  PortalAdminOrgId:
+    Description: >-
+      Customer-portal admin login identity (the deployment org_id). Log in at
+      the portal UI / POST /api/v1/auth/login with this org_id and the password
+      from PortalAdminPasswordSecretArn.
+    Value: !Ref OrganizationID
+    Export:
+      Name: !Sub '${AWS::StackName}-PortalAdminOrgId'
+
+  PortalAdminPasswordSecretArn:
+    Description: >-
+      Secrets Manager ARN holding the initial customer-portal admin password
+      (the value is NOT exposed here). Retrieve with:
+      aws secretsmanager get-secret-value --secret-id <this-arn> --query SecretString --output text
+      Change the password on first login.
+    Value: !Ref PortalAdminPasswordSecret
+    Export:
+      Name: !Sub '${AWS::StackName}-PortalAdminPasswordSecretArn'
+
   ClusterName:
     Description: ECS Cluster Name
     Value: !Ref AxonFlowCluster
