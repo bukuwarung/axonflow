@@ -1,0 +1,4 @@
+// Jenkinsfile
+import groovy.json.JsonOutput;
+@Library('jenkins-shared-libs@one-click-deployment-jakarta') _
+terraformCD("axonflow-customer-portal-ui", "prod")

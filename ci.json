@@ -1,0 +1,8 @@
+{
+    "release": "0.1",
+    "build_cmd": "echo 'AxonFlow images are pre-built partner images; nothing to build here.'",
+    "slack_channel": "jenkins-build-status",
+    "sonarqube_run": false,
+    "sonarqube_url": "https://sonarqube-v2.bukuwarung.com",
+    "sonarqube_project_key": "axonflow"
+}

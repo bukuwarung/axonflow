@@ -1,0 +1,29 @@
+{
+  "Version": "2012-10-17",
+  "Statement": [
+    {
+      "Sid": "EFSAuditFallback",
+      "Effect": "Allow",
+      "Action": [
+        "elasticfilesystem:ClientMount",
+        "elasticfilesystem:ClientWrite",
+        "elasticfilesystem:ClientRootAccess",
+        "elasticfilesystem:DescribeMountTargets",
+        "elasticfilesystem:DescribeAccessPoints",
+        "elasticfilesystem:DescribeFileSystems"
+      ],
+      "Resource": [
+        "arn:aws:elasticfilesystem:ap-southeast-3:944054652613:file-system/fs-REPLACE_WITH_AXONFLOW_EFS_ID",
+        "arn:aws:elasticfilesystem:ap-southeast-3:944054652613:access-point/fsap-REPLACE_WITH_AXONFLOW_ACCESS_POINT_ID"
+      ]
+    },
+    {
+      "Sid": "CloudWatchMetrics",
+      "Effect": "Allow",
+      "Action": [
+        "cloudwatch:PutMetricData"
+      ],
+      "Resource": "*"
+    }
+  ]
+}

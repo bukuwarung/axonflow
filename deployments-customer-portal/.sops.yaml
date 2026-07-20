@@ -1,0 +1,7 @@
+creation_rules:
+    - path_regex: dev\.ini$
+      kms: arn:aws:kms:ap-southeast-1:412701086342:key/a764f870-f478-4bd6-a5c5-57f53c8577f8
+    - path_regex: staging\.ini$
+      kms: arn:aws:kms:ap-southeast-1:412701086342:key/0a8ec350-ec5d-434d-8408-57201f2c767c
+    - path_regex: prod\.ini$
+      kms: arn:aws:kms:ap-southeast-3:944054652613:key/mrk-9c7c550bf4014e9d978a67b109c0a25e
