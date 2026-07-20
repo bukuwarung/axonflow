@@ -49,8 +49,18 @@ type auditSearchCriteria struct {
 	// first-class audit_logs.session_id column. Lets a session-summary bucket
 	// (#2759) drill down into its raw events via ?session_id=X.
 	SessionID string
-	Limit     int
-	Offset    int
+	// ScopeUserEmail is the ENFORCED own-rows read scope (#2922) — the
+	// canonical email of a non-tenant-wide caller, applied as an exact
+	// case-insensitive predicate (LOWER(user_email) = $n) that a caller-
+	// supplied UserEmail filter can only narrow, never widen. It is derived
+	// server-side from resolveCallerReadScope and MUST NEVER be populated
+	// from a request body or query string. Distinct from UserEmail (the
+	// ILIKE substring FILTER) because a substring match is not a security
+	// boundary: an injected substring over-matches sibling identities
+	// ("dev@x.com" ⊂ "otherdev@x.com").
+	ScopeUserEmail string
+	Limit          int
+	Offset         int
 }
 
 // asAuditSearchCriteria is a best-effort adapter from the various anonymous
@@ -108,6 +118,10 @@ func asAuditSearchCriteria(criteria interface{}) (auditSearchCriteria, bool) {
 		case "SessionID":
 			if fv.Kind() == reflect.String {
 				out.SessionID = fv.String()
+			}
+		case "ScopeUserEmail":
+			if fv.Kind() == reflect.String {
+				out.ScopeUserEmail = fv.String()
 			}
 		case "Action":
 			if fv.Kind() == reflect.String {
@@ -673,7 +687,18 @@ func (l *AuditLogger) LogPlanOperation(ctx context.Context, entry *PlanAuditEntr
 // ToolCallAuditEntry represents an audit entry for non-LLM tool calls
 // (API calls, webhooks, MCP tool executions by external orchestrators)
 type ToolCallAuditEntry struct {
-	ToolName        string                 `json:"tool_name"`
+	ToolName string `json:"tool_name"`
+	// CallerName identifies which client/integration made the call (#2912) —
+	// e.g. claude_code, codex, cursor, openclaw. Preferred over the legacy
+	// ToolType field below.
+	CallerName string `json:"caller_name,omitempty"`
+	// ToolType is DEPRECATED (#2912) — it was misnamed for what every real
+	// caller actually used it for (client identity, not a tool-kind concept).
+	// Kept as a legacy input fallback: a caller that hasn't upgraded to
+	// CallerName yet still works. auditToolCallHandler/LogToolCallAudit
+	// resolve the fallback chain (CallerName -> ToolType -> "unknown" default,
+	// #2903) and stop writing policy_details.tool_type for new rows — only
+	// policy_details.caller_name is written going forward.
 	ToolType        string                 `json:"tool_type,omitempty"`
 	Input           map[string]interface{} `json:"input,omitempty"`
 	Output          map[string]interface{} `json:"output,omitempty"`
@@ -709,9 +734,19 @@ func (l *AuditLogger) LogToolCallAudit(ctx context.Context, entry *ToolCallAudit
 	policyDetails := map[string]interface{}{
 		"tool_name": entry.ToolName,
 	}
-	if entry.ToolType != "" {
-		policyDetails["tool_type"] = entry.ToolType
+	// #2912: caller_name replaces tool_type going forward. Fallback chain:
+	// CallerName if supplied -> legacy ToolType if supplied -> "unknown"
+	// default (#2903 — an unidentified caller must not be silently attributed
+	// to the specific client "claude_code"). policy_details.tool_type is no
+	// longer written for new rows — only policy_details.caller_name.
+	callerName := entry.CallerName
+	if callerName == "" {
+		callerName = entry.ToolType
 	}
+	if callerName == "" {
+		callerName = "unknown"
+	}
+	policyDetails["caller_name"] = callerName
 	if entry.Input != nil {
 		policyDetails["input"] = entry.Input
 	}
@@ -807,6 +842,19 @@ func (l *AuditLogger) SearchAuditLogs(criteria interface{}) ([]*AuditEntry, int,
 		}
 	} else if searchReq, ok := asAuditSearchCriteria(criteria); ok {
 		// Handle general search (from auditSearchHandler or via named-type callers).
+		//
+		// #2922 enforced read scope — FIRST, so it can never be displaced by a
+		// caller filter. Exact case-insensitive match on the canonical email
+		// (write paths canonicalize via sharedidentity.CanonicalEmail; LOWER()
+		// on the column keeps pre-canonicalization historical rows readable by
+		// their owner). Deliberately NOT the ILIKE substring filter below —
+		// substring matching over-matches sibling identities and is not a
+		// security boundary.
+		if searchReq.ScopeUserEmail != "" {
+			query += fmt.Sprintf(" AND LOWER(user_email) = $%d", argIndex)
+			args = append(args, strings.ToLower(searchReq.ScopeUserEmail))
+			argIndex++
+		}
 		if searchReq.UserEmail != "" {
 			query += fmt.Sprintf(" AND user_email ILIKE '%%' || $%d || '%%'", argIndex)
 			args = append(args, searchReq.UserEmail)

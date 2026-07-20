@@ -113,10 +113,10 @@ func getSDKCompatibility() SDKCompatInfo {
 		// rust enters at 0.8.1 (execute_plan status fix + the 9.7.0 train
 		// examples baseline). Mirrors platform/agent/capabilities.go.
 		RecommendedSDKVersion: map[string]string{
-			"python":     "8.5.1",
-			"typescript": "8.5.1",
-			"go":         "8.5.1",
-			"java":       "8.5.1",
+			"python":     "9.0.0",
+			"typescript": "9.0.0",
+			"go":         "9.0.0",
+			"java":       "9.0.0",
 			"rust":       "0.8.1",
 		},
 	}
@@ -181,12 +181,19 @@ func getPluginCompatibility() PluginCompatInfo {
 		// decide + check-output for the per-client version telemetry
 		// (desktop#23). cursor/codex/openclaw unchanged. MinPluginVersion
 		// floor stays 1.4.0 / 2.4.0 (claude-desktop's floor is 0.2.0, see
-		// above). Mirrors platform/agent/capabilities.go.
+		// above).
+		// 9.10.0 release-train (#2919 fleet RBAC per-user identity): all four
+		// bumped — claude-code 1.9.1 -> 1.10.0, cursor 1.5.3 -> 1.6.0, codex
+		// 1.5.2 -> 1.6.0, openclaw 2.6.6 -> 2.7.0 — each now sends the per-user
+		// token header for per-user read-scoping; below the recommended
+		// version a plugin keeps working (floor unchanged) but reads the
+		// shared-identity zero-rows fallback. claude-desktop unchanged.
+		// Mirrors platform/agent/capabilities.go.
 		RecommendedPluginVersion: map[string]string{
-			"openclaw":       "2.6.6",
-			"claude-code":    "1.9.1",
-			"cursor":         "1.5.3",
-			"codex":          "1.5.2",
+			"openclaw":       "2.8.0",
+			"claude-code":    "1.11.0",
+			"cursor":         "1.7.0",
+			"codex":          "1.7.0",
 			"claude-desktop": "0.3.1",
 		},
 	}

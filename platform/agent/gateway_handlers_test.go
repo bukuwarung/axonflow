@@ -2365,10 +2365,10 @@ func TestValidateGatewayContext_DBError(t *testing.T) {
 
 // testMockConnector implements base.Connector for testing fetchApprovedData
 type testMockConnector struct {
-	name       string
-	connType   string
-	queryErr   error
-	queryRows  []map[string]interface{}
+	name      string
+	connType  string
+	queryErr  error
+	queryRows []map[string]interface{}
 }
 
 func (m *testMockConnector) Connect(ctx context.Context, config *base.ConnectorConfig) error {
@@ -2404,9 +2404,9 @@ func (m *testMockConnector) Execute(ctx context.Context, cmd *base.Command) (*ba
 	return &base.CommandResult{Success: true}, nil
 }
 
-func (m *testMockConnector) Name() string         { return m.name }
-func (m *testMockConnector) Type() string         { return m.connType }
-func (m *testMockConnector) Version() string      { return "1.0.0-test" }
+func (m *testMockConnector) Name() string           { return m.name }
+func (m *testMockConnector) Type() string           { return m.connType }
+func (m *testMockConnector) Version() string        { return "1.0.0-test" }
 func (m *testMockConnector) Capabilities() []string { return []string{"query"} }
 
 // TestFetchApprovedData_WithMockConnector tests fetchApprovedData with a real connector
@@ -2809,34 +2809,34 @@ func TestPreCheckHandler_RBIPIIIntegration(t *testing.T) {
 	// Policy evaluation uses unified shared engine (legacy engine removed)
 
 	tests := []struct {
-		name              string
-		query             string
-		expectApproved    bool // With PII_ACTION=redact (default), all approved but PII flagged
-		expectRedaction   bool // Whether redaction is required
+		name            string
+		query           string
+		expectApproved  bool // With PII_ACTION=redact (default), all approved but PII flagged
+		expectRedaction bool // Whether redaction is required
 	}{
 		{
-			name:              "Normal query without India PII",
-			query:             "What is the GDP of India?",
-			expectApproved:    true,
-			expectRedaction:   false,
+			name:            "Normal query without India PII",
+			query:           "What is the GDP of India?",
+			expectApproved:  true,
+			expectRedaction: false,
 		},
 		{
-			name:              "Query with Aadhaar number (approved with redaction)",
-			query:             "My Aadhaar is 2234 5678 9012",
-			expectApproved:    true, // Default PII_ACTION=redact approves with flag
-			expectRedaction:   true,
+			name:            "Query with Aadhaar number (approved with redaction)",
+			query:           "My Aadhaar is 2234 5678 9012",
+			expectApproved:  true, // Default PII_ACTION=redact approves with flag
+			expectRedaction: true,
 		},
 		{
-			name:              "Query with PAN number (approved with redaction)",
-			query:             "My PAN number is ABCDE1234F",
-			expectApproved:    true, // Default PII_ACTION=redact approves with flag
-			expectRedaction:   true,
+			name:            "Query with PAN number (approved with redaction)",
+			query:           "My PAN number is ABCDE1234F",
+			expectApproved:  true, // Default PII_ACTION=redact approves with flag
+			expectRedaction: true,
 		},
 		{
-			name:              "Query with UPI ID (approved with redaction)",
-			query:             "Send money to user@ybl",
-			expectApproved:    true, // Default PII_ACTION=redact approves with flag
-			expectRedaction:   true,
+			name:            "Query with UPI ID (approved with redaction)",
+			query:           "Send money to user@ybl",
+			expectApproved:  true, // Default PII_ACTION=redact approves with flag
+			expectRedaction: true,
 		},
 	}
 
@@ -2881,12 +2881,20 @@ func TestPreCheckHandler_RBIPIIIntegration(t *testing.T) {
 
 // TestConvertSharedResultToStatic tests the conversion from shared policy engine
 // results to StaticPolicyResult for backward compatibility.
+//
+// #2965: the mapping is now ACTION-AWARE. A non-blocking PII match produces a
+// redaction obligation ONLY when its resolved action is redact; warn/log
+// produce an advisory reason and NO redaction. The cases below were rewritten
+// from the pre-#2965 shape, where ANY non-blocking PII match (even warn) set
+// RequiresRedaction — that was the sibling bug (warn/log postures silently
+// redacted). expectAdvisory pins the new warn/log signal.
 func TestConvertSharedResultToStatic(t *testing.T) {
 	tests := []struct {
 		name              string
 		input             *sharedpolicy.RequestResult
 		expectBlocked     bool
 		expectRedaction   bool
+		expectAdvisory    bool
 		expectPolicyCount int
 	}{
 		{
@@ -2919,7 +2927,8 @@ func TestConvertSharedResultToStatic(t *testing.T) {
 			expectPolicyCount: 1,
 		},
 		{
-			name: "PII detection with warn action sets RequiresRedaction",
+			// #2965: warn action no longer redacts — it yields an advisory reason.
+			name: "PII detection with warn action yields advisory reason, not redaction",
 			input: &sharedpolicy.RequestResult{
 				Blocked: false, // Not blocked because action is warn
 				MatchedPolicies: []sharedpolicy.PolicyMatch{
@@ -2932,18 +2941,36 @@ func TestConvertSharedResultToStatic(t *testing.T) {
 				ProcessingTimeMs: 3,
 			},
 			expectBlocked:     false,
+			expectRedaction:   false,
+			expectAdvisory:    true,
+			expectPolicyCount: 1,
+		},
+		{
+			name: "PII US redact action sets RequiresRedaction",
+			input: &sharedpolicy.RequestResult{
+				Blocked: false,
+				MatchedPolicies: []sharedpolicy.PolicyMatch{
+					{
+						PolicyID: "sys_pii_ssn",
+						Category: sharedpolicy.CategoryPIIUS,
+						Action:   sharedpolicy.ActionRedact,
+					},
+				},
+				ProcessingTimeMs: 3,
+			},
+			expectBlocked:     false,
 			expectRedaction:   true,
 			expectPolicyCount: 1,
 		},
 		{
-			name: "PII India category sets RequiresRedaction",
+			name: "PII India redact action sets RequiresRedaction",
 			input: &sharedpolicy.RequestResult{
 				Blocked: false,
 				MatchedPolicies: []sharedpolicy.PolicyMatch{
 					{
 						PolicyID: "sys_pii_aadhaar",
 						Category: sharedpolicy.CategoryPIIIndia,
-						Action:   sharedpolicy.ActionWarn,
+						Action:   sharedpolicy.ActionRedact,
 					},
 				},
 				ProcessingTimeMs: 2,
@@ -2953,14 +2980,14 @@ func TestConvertSharedResultToStatic(t *testing.T) {
 			expectPolicyCount: 1,
 		},
 		{
-			name: "PII EU category sets RequiresRedaction",
+			name: "PII EU redact action sets RequiresRedaction",
 			input: &sharedpolicy.RequestResult{
 				Blocked: false,
 				MatchedPolicies: []sharedpolicy.PolicyMatch{
 					{
 						PolicyID: "sys_pii_eu_vat",
 						Category: sharedpolicy.CategoryPIIEU,
-						Action:   sharedpolicy.ActionWarn,
+						Action:   sharedpolicy.ActionRedact,
 					},
 				},
 				ProcessingTimeMs: 2,
@@ -2970,14 +2997,34 @@ func TestConvertSharedResultToStatic(t *testing.T) {
 			expectPolicyCount: 1,
 		},
 		{
-			name: "PII Global category sets RequiresRedaction",
+			name: "PII Global redact action sets RequiresRedaction",
 			input: &sharedpolicy.RequestResult{
 				Blocked: false,
 				MatchedPolicies: []sharedpolicy.PolicyMatch{
 					{
 						PolicyID: "sys_pii_email",
 						Category: sharedpolicy.CategoryPIIGlobal,
-						Action:   sharedpolicy.ActionWarn,
+						Action:   sharedpolicy.ActionRedact,
+					},
+				},
+				ProcessingTimeMs: 2,
+			},
+			expectBlocked:     false,
+			expectRedaction:   true,
+			expectPolicyCount: 1,
+		},
+		{
+			// #2965 direct regression at the convert layer: pii-indonesia under
+			// the default redact posture MUST set RequiresRedaction (it silently
+			// did not before the fix — the omitted-category bug).
+			name: "PII Indonesia redact action sets RequiresRedaction",
+			input: &sharedpolicy.RequestResult{
+				Blocked: false,
+				MatchedPolicies: []sharedpolicy.PolicyMatch{
+					{
+						PolicyID: "sys_pii_indonesia_ktp",
+						Category: sharedpolicy.CategoryPIIIndonesia,
+						Action:   sharedpolicy.ActionRedact,
 					},
 				},
 				ProcessingTimeMs: 2,
@@ -3024,7 +3071,10 @@ func TestConvertSharedResultToStatic(t *testing.T) {
 			expectPolicyCount: 1,
 		},
 		{
-			name: "multiple policies including PII",
+			// admin-access (non-PII, log) contributes no PII signal; the PII
+			// match resolves to redact, so RequiresRedaction is set. Both are
+			// still counted in TriggeredPolicies.
+			name: "multiple policies including a redacting PII match",
 			input: &sharedpolicy.RequestResult{
 				Blocked: false,
 				MatchedPolicies: []sharedpolicy.PolicyMatch{
@@ -3036,12 +3086,37 @@ func TestConvertSharedResultToStatic(t *testing.T) {
 					{
 						PolicyID: "sys_pii_ssn",
 						Category: sharedpolicy.CategoryPIIUS,
-						Action:   sharedpolicy.ActionWarn,
+						Action:   sharedpolicy.ActionRedact,
 					},
 				},
 			},
 			expectBlocked:     false,
 			expectRedaction:   true,
+			expectPolicyCount: 2,
+		},
+		{
+			// #2965 sibling-bug regression: a PII match resolved to log yields an
+			// advisory reason and NO redaction. A non-PII log match (admin) is
+			// counted but contributes no PII signal.
+			name: "PII log action yields advisory reason, non-PII log ignored",
+			input: &sharedpolicy.RequestResult{
+				Blocked: false,
+				MatchedPolicies: []sharedpolicy.PolicyMatch{
+					{
+						PolicyID: "admin_access",
+						Category: sharedpolicy.CategoryAdminAccess,
+						Action:   sharedpolicy.ActionLog,
+					},
+					{
+						PolicyID: "sys_pii_ssn",
+						Category: sharedpolicy.CategoryPIIUS,
+						Action:   sharedpolicy.ActionLog,
+					},
+				},
+			},
+			expectBlocked:     false,
+			expectRedaction:   false,
+			expectAdvisory:    true,
 			expectPolicyCount: 2,
 		},
 	}
@@ -3058,6 +3133,10 @@ func TestConvertSharedResultToStatic(t *testing.T) {
 				t.Errorf("RequiresRedaction = %v, want %v", result.RequiresRedaction, tt.expectRedaction)
 			}
 
+			if gotAdvisory := len(result.AdvisoryReasons) > 0; gotAdvisory != tt.expectAdvisory {
+				t.Errorf("advisory reasons present = %v (%v), want %v", gotAdvisory, result.AdvisoryReasons, tt.expectAdvisory)
+			}
+
 			if len(result.TriggeredPolicies) != tt.expectPolicyCount {
 				t.Errorf("TriggeredPolicies count = %d, want %d", len(result.TriggeredPolicies), tt.expectPolicyCount)
 			}
@@ -3065,8 +3144,14 @@ func TestConvertSharedResultToStatic(t *testing.T) {
 	}
 }
 
-// TestIsPIICategory tests the isPIICategory helper function.
-func TestIsPIICategory(t *testing.T) {
+// TestAgentPIICategoryConvergence pins that the agent's /decide obligation
+// bridge classifies PII by the SHARED prefix predicate sharedpolicy.
+// IsPIIPolicyCategory — including pii-indonesia, whose omission from the old
+// agent-local switch was the #2965 bug — and NOT a duplicate enumerated switch.
+// The predicate's own behavior is exhaustively pinned in
+// shared/policy TestIsPIIPolicyCategory_Convention; this test guards the
+// convergence: every pii-* category (Indonesia included) is PII to the agent.
+func TestAgentPIICategoryConvergence(t *testing.T) {
 	tests := []struct {
 		category sharedpolicy.PolicyCategory
 		expected bool
@@ -3075,6 +3160,8 @@ func TestIsPIICategory(t *testing.T) {
 		{sharedpolicy.CategoryPIIUS, true},
 		{sharedpolicy.CategoryPIIIndia, true},
 		{sharedpolicy.CategoryPIIEU, true},
+		{sharedpolicy.CategoryPIISingapore, true},
+		{sharedpolicy.CategoryPIIIndonesia, true}, // #2965: previously omitted → silent allow
 		{sharedpolicy.CategorySecuritySQLi, false},
 		{sharedpolicy.CategorySecurityDangerous, false},
 		{sharedpolicy.CategoryAdminAccess, false},
@@ -3083,13 +3170,14 @@ func TestIsPIICategory(t *testing.T) {
 		{sharedpolicy.CategoryComplianceHIPAA, false},
 		{sharedpolicy.CategoryComplianceRBI, false},
 		{sharedpolicy.CategoryComplianceSEBI, false},
+		{sharedpolicy.CategoryMediaPII, false}, // OCR subsystem, not the text engine
 	}
 
 	for _, tt := range tests {
 		t.Run(string(tt.category), func(t *testing.T) {
-			result := isPIICategory(tt.category)
+			result := sharedpolicy.IsPIIPolicyCategory(tt.category)
 			if result != tt.expected {
-				t.Errorf("isPIICategory(%s) = %v, want %v", tt.category, result, tt.expected)
+				t.Errorf("IsPIIPolicyCategory(%s) = %v, want %v", tt.category, result, tt.expected)
 			}
 		})
 	}
@@ -3116,16 +3204,16 @@ func TestPreCheckHandler_BudgetEnforcement(t *testing.T) {
 	mockRepo := &mockCostRepository{
 		budgets: map[string]*cost.Budget{
 			"test-budget-1": {
-				ID:        "test-budget-1",
-				Name:      "Test Budget",
-				Scope:     cost.ScopeOrganization,
-				ScopeID:   testOrgID,
-				LimitUSD:  100.0,
-				Period:    cost.PeriodMonthly,
-				OnExceed:  cost.OnExceedBlock,
-				OrgID:     testOrgID,
-				TenantID:  "test-client",
-				Enabled:   true,
+				ID:       "test-budget-1",
+				Name:     "Test Budget",
+				Scope:    cost.ScopeOrganization,
+				ScopeID:  testOrgID,
+				LimitUSD: 100.0,
+				Period:   cost.PeriodMonthly,
+				OnExceed: cost.OnExceedBlock,
+				OrgID:    testOrgID,
+				TenantID: "test-client",
+				Enabled:  true,
 			},
 		},
 		usageSum: map[string]float64{
@@ -3250,11 +3338,22 @@ func (m *mockCostRepository) GetBudget(ctx context.Context, id string) (*cost.Bu
 	return nil, errors.New("budget not found")
 }
 
+// GetBudgetScoped / DeleteBudgetScoped satisfy the org/tenant-scoped read path
+// added in #2934; the agent-side mock does not exercise scoping, so they defer
+// to the unscoped variants.
+func (m *mockCostRepository) GetBudgetScoped(ctx context.Context, id, orgID, tenantID string) (*cost.Budget, error) {
+	return m.GetBudget(ctx, id)
+}
+
 func (m *mockCostRepository) UpdateBudget(ctx context.Context, budget *cost.Budget) error {
 	return nil
 }
 
 func (m *mockCostRepository) DeleteBudget(ctx context.Context, id string) error {
+	return nil
+}
+
+func (m *mockCostRepository) DeleteBudgetScoped(ctx context.Context, id, orgID, tenantID string) error {
 	return nil
 }
 
@@ -3545,8 +3644,8 @@ func TestConvertSharedResultToStatic_NilInput(t *testing.T) {
 // TestConvertSharedResultToStatic_RequireApproval tests HITL action conversion
 func TestConvertSharedResultToStatic_RequireApproval(t *testing.T) {
 	sharedResult := &sharedpolicy.RequestResult{
-		Blocked:          false,
-		BlockReason:      "",
+		Blocked:           false,
+		BlockReason:       "",
 		PoliciesEvaluated: 1,
 		MatchedPolicies: []sharedpolicy.PolicyMatch{
 			{

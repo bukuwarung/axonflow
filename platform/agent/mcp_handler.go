@@ -2055,7 +2055,7 @@ func mcpExecuteHandler(w http.ResponseWriter, r *http.Request) {
 	// A write-path call is blocked (canonical "blocked" audit row,
 	// non-overridable); read-path calls fall through to normal governance.
 	// Mirrors the mcp_server_handler check_policy gate; reuses classifyMCPCall.
-	if readOnlyPostureEnabled() && classifyMCPCall(req.Connector, operation) == mcpAccessWrite {
+	if readOnlyPostureEnabled() && classifyMCPCall(req.Connector, "", operation) == mcpAccessWrite {
 		reason := fmt.Sprintf("read-only posture active: write-path tool call %q is blocked; only read-path operations are permitted", req.Connector)
 		auditEntry.RequestBlocked = true
 		auditEntry.RequestBlockReason = reason
@@ -2305,15 +2305,19 @@ func mcpExecuteHandler(w http.ResponseWriter, r *http.Request) {
 // MCPCheckInputRequest is the request body for POST /api/v1/mcp/check-input.
 // External orchestrators submit the proposed statement before executing it themselves.
 type MCPCheckInputRequest struct {
-	ClientID      string                 `json:"client_id"`
-	UserToken     string                 `json:"user_token"`
-	TenantID      string                 `json:"tenant_id"`
-	UserID        string                 `json:"user_id,omitempty"`
-	UserRole      string                 `json:"user_role,omitempty"`
-	ConnectorType string                 `json:"connector_type"`
-	Statement     string                 `json:"statement"`
-	Parameters    map[string]interface{} `json:"parameters,omitempty"`
-	Operation     string                 `json:"operation,omitempty"` // "query" or "execute"; defaults to "execute"
+	ClientID      string `json:"client_id"`
+	UserToken     string `json:"user_token"`
+	TenantID      string `json:"tenant_id"`
+	UserID        string `json:"user_id,omitempty"`
+	UserRole      string `json:"user_role,omitempty"`
+	ConnectorType string `json:"connector_type"`
+	// Tool is the caller-sent tool identity (#2904), distinct from
+	// ConnectorType/server. Passed through as evaluateInputPolicies'
+	// toolIdentity param instead of duplicating ConnectorType into both.
+	Tool       string                 `json:"tool,omitempty"`
+	Statement  string                 `json:"statement"`
+	Parameters map[string]interface{} `json:"parameters,omitempty"`
+	Operation  string                 `json:"operation,omitempty"` // "query" or "execute"; defaults to "execute"
 	// ContentType selects the request-redaction detector (ADR-056 / #2563
 	// addendum). Empty defaults to "text/plain". A content_type with no
 	// registered detector is rejected (415) so the caller fails closed rather
@@ -2381,15 +2385,23 @@ type RicherPolicyMatch struct {
 // MCPCheckOutputRequest is the request body for POST /api/v1/mcp/check-output.
 // External orchestrators submit the raw connector response for policy scanning.
 type MCPCheckOutputRequest struct {
-	ClientID      string                   `json:"client_id"`
-	UserToken     string                   `json:"user_token"`
-	TenantID      string                   `json:"tenant_id"`
-	UserID        string                   `json:"user_id,omitempty"`
-	ConnectorType string                   `json:"connector_type"`
-	ResponseData  []map[string]interface{} `json:"response_data,omitempty"` // query-style row results
-	Message       string                   `json:"message,omitempty"`       // execute-style response message
-	Metadata      map[string]interface{}   `json:"metadata,omitempty"`      // connector metadata (used by SQLi scanning)
-	RowCount      int                      `json:"row_count,omitempty"`
+	ClientID      string `json:"client_id"`
+	UserToken     string `json:"user_token"`
+	TenantID      string `json:"tenant_id"`
+	UserID        string `json:"user_id,omitempty"`
+	ConnectorType string `json:"connector_type"`
+	// Tool is the caller-sent tool identity (#2904/#2955), distinct from
+	// ConnectorType/server. Passed through as evaluateOutputPolicies'
+	// toolIdentity param instead of duplicating ConnectorType into both, so
+	// response-plane capability scoping keys off server.tool rather than the
+	// bare server (the langgraph de-concat SDKs already send it here). Omitted →
+	// empty toolIdentity → full (fail-closed) evaluation; no fallback from
+	// ConnectorType, mirroring the check-input plane.
+	Tool         string                   `json:"tool,omitempty"`
+	ResponseData []map[string]interface{} `json:"response_data,omitempty"` // query-style row results
+	Message      string                   `json:"message,omitempty"`       // execute-style response message
+	Metadata     map[string]interface{}   `json:"metadata,omitempty"`      // connector metadata (used by SQLi scanning)
+	RowCount     int                      `json:"row_count,omitempty"`
 }
 
 // MCPCheckOutputResponse is the response body for POST /api/v1/mcp/check-output.
@@ -2468,7 +2480,8 @@ func mcpCheckInputHandler(w http.ResponseWriter, r *http.Request) {
 			[]string{"unauthenticated"},
 			[]string{"authentication failed: " + authErr.Message},
 			nil,
-			traceIDFromHeader(r.Header.Get("traceparent")))
+			traceIDFromHeader(r.Header.Get("traceparent")),
+			req.ConnectorType, req.Tool) // #2904: tool_server, tool_name
 		sendErrorResponse(w, authErr.Message, authErr.HTTPStatus, nil)
 		return
 	}
@@ -2507,7 +2520,8 @@ func mcpCheckInputHandler(w http.ResponseWriter, r *http.Request) {
 			[]string{"content_type_unsupported"},
 			[]string{"no redaction detector registered for content_type: " + req.ContentType},
 			nil,
-			traceIDFromHeader(r.Header.Get("traceparent")))
+			traceIDFromHeader(r.Header.Get("traceparent")),
+			req.ConnectorType, req.Tool) // #2904: tool_server, tool_name
 		sendErrorResponse(w, "no redaction detector registered for content_type: "+req.ContentType, http.StatusUnsupportedMediaType, nil)
 		return
 	}
@@ -2570,7 +2584,8 @@ func mcpCheckInputHandler(w http.ResponseWriter, r *http.Request) {
 			[]string{"tenant_mismatch"},
 			[]string{"resolved user tenant does not match authenticated client tenant"},
 			nil,
-			traceIDFromHeader(r.Header.Get("traceparent")))
+			traceIDFromHeader(r.Header.Get("traceparent")),
+			req.ConnectorType, req.Tool) // #2904: tool_server, tool_name
 		sendErrorResponse(w, "Tenant mismatch", http.StatusForbidden, nil)
 		return
 	}
@@ -2615,7 +2630,8 @@ func mcpCheckInputHandler(w http.ResponseWriter, r *http.Request) {
 			[]string{"tenant_id_missing"},
 			[]string{"tenant_id is required"},
 			nil,
-			traceIDFromHeader(r.Header.Get("traceparent")))
+			traceIDFromHeader(r.Header.Get("traceparent")),
+			req.ConnectorType, req.Tool) // #2904: tool_server, tool_name
 		sendErrorResponse(w, "tenant_id is required", http.StatusBadRequest, nil)
 		return
 	}
@@ -2690,6 +2706,8 @@ func mcpCheckInputHandler(w http.ResponseWriter, r *http.Request) {
 					// /decide stage) of the SAME logical tool call when the gateway
 					// propagates a W3C traceparent. Absent header → "" → singleton.
 					correlationID: traceIDFromHeader(r.Header.Get("traceparent")),
+					toolServer:    req.ConnectorType, // #2904
+					toolName:      req.Tool,          // #2904
 				})
 		}
 
@@ -2699,7 +2717,7 @@ func mcpCheckInputHandler(w http.ResponseWriter, r *http.Request) {
 		// be refused here, before policy evaluation and the override flow, so the
 		// PEP never forwards it. Non-overridable; canonical "blocked" audit row.
 		// Mirrors the mcp_server_handler check_policy gate; reuses classifyMCPCall.
-		if readOnlyPostureEnabled() && classifyMCPCall(req.ConnectorType, operation) == mcpAccessWrite {
+		if readOnlyPostureEnabled() && classifyMCPCall(req.ConnectorType, req.Tool, operation) == mcpAccessWrite {
 			reason := fmt.Sprintf("read-only posture active: write-path tool call %q is blocked; only read-path operations are permitted", req.ConnectorType)
 			auditEntry.RequestBlocked = true
 			auditEntry.RequestBlockReason = reason
@@ -2714,7 +2732,8 @@ func mcpCheckInputHandler(w http.ResponseWriter, r *http.Request) {
 				[]string{readOnlyPosturePolicyID},
 				[]string{reason},
 				nil,
-				traceIDFromHeader(r.Header.Get("traceparent")))
+				traceIDFromHeader(r.Header.Get("traceparent")),
+				req.ConnectorType, req.Tool) // #2904: tool_server, tool_name
 			w.Header().Set("Content-Type", "application/json")
 			w.WriteHeader(http.StatusForbidden)
 			_ = json.NewEncoder(w).Encode(MCPCheckInputResponse{
@@ -2731,7 +2750,7 @@ func mcpCheckInputHandler(w http.ResponseWriter, r *http.Request) {
 		mcpDetectionCfg := ResolveMCPDetectionConfig(ctx, orgID)
 		outcome := evaluateInputPolicies(ctx,
 			tenantID, orgID, userID, userRole,
-			req.ConnectorType, req.ConnectorType /* toolIdentity: advisory plane, caller-sent tool identity (#2801) */, operation, req.Statement, req.Parameters,
+			req.ConnectorType, req.Tool /* toolIdentity: advisory plane, caller-sent tool identity (#2801, #2904) */, operation, req.Statement, req.Parameters,
 			mcpDetectionCfg, true /* runDynamicPolicy */)
 
 		if outcome.EvalUnavailable {
@@ -2751,7 +2770,8 @@ func mcpCheckInputHandler(w http.ResponseWriter, r *http.Request) {
 				[]string{"dynamic_policy_unavailable"},
 				[]string{"dynamic policy evaluation unavailable"},
 				nil,
-				traceIDFromHeader(r.Header.Get("traceparent")))
+				traceIDFromHeader(r.Header.Get("traceparent")),
+				req.ConnectorType, req.Tool) // #2904: tool_server, tool_name
 			sendErrorResponse(w, "Dynamic policy evaluation unavailable", http.StatusServiceUnavailable, nil)
 			return
 		}
@@ -2862,7 +2882,8 @@ func mcpCheckInputHandler(w http.ResponseWriter, r *http.Request) {
 					userID, userRole,
 					"mcp_check_input", fmt.Sprintf("mcp check-input: %s", req.ConnectorType), auditEntry.StatementHash,
 					outcome.StaticResult.BlockReason, topRisk, matches,
-					traceIDFromHeader(r.Header.Get("traceparent"))) // #2598 correlation
+					traceIDFromHeader(r.Header.Get("traceparent")), // #2598 correlation
+					req.ConnectorType, req.Tool) // #2904: tool_server, tool_name
 
 				w.Header().Set("Content-Type", "application/json")
 				w.WriteHeader(http.StatusForbidden)
@@ -2940,7 +2961,8 @@ func mcpCheckInputHandler(w http.ResponseWriter, r *http.Request) {
 				userID, userRole,
 				"mcp_check_input", inputDescriptor, computeStatementHash(inputDescriptor),
 				mcpVerdictRedacted, pids, reasons, auditEntry.ResponseRedactedFields,
-				traceIDFromHeader(r.Header.Get("traceparent")))
+				traceIDFromHeader(r.Header.Get("traceparent")),
+				req.ConnectorType, req.Tool) // #2904: tool_server, tool_name
 		} else {
 			emitInputDecision(v, pids, reasons)
 		}
@@ -3011,7 +3033,8 @@ func mcpCheckOutputHandler(w http.ResponseWriter, r *http.Request) {
 			[]string{"unauthenticated"},
 			[]string{"authentication failed: " + authErr.Message},
 			nil,
-			traceIDFromHeader(r.Header.Get("traceparent")))
+			traceIDFromHeader(r.Header.Get("traceparent")),
+			req.ConnectorType, req.Tool) // #2955: tool_server, tool_name
 		sendErrorResponse(w, authErr.Message, authErr.HTTPStatus, nil)
 		return
 	}
@@ -3082,7 +3105,8 @@ func mcpCheckOutputHandler(w http.ResponseWriter, r *http.Request) {
 			[]string{"tenant_mismatch"},
 			[]string{"resolved user tenant does not match authenticated client tenant"},
 			nil,
-			traceIDFromHeader(r.Header.Get("traceparent")))
+			traceIDFromHeader(r.Header.Get("traceparent")),
+			req.ConnectorType, req.Tool) // #2955: tool_server, tool_name
 		sendErrorResponse(w, "Tenant mismatch", http.StatusForbidden, nil)
 		return
 	}
@@ -3115,7 +3139,8 @@ func mcpCheckOutputHandler(w http.ResponseWriter, r *http.Request) {
 			[]string{"tenant_id_missing"},
 			[]string{"tenant_id is required"},
 			nil,
-			traceIDFromHeader(r.Header.Get("traceparent")))
+			traceIDFromHeader(r.Header.Get("traceparent")),
+			req.ConnectorType, req.Tool) // #2955: tool_server, tool_name
 		sendErrorResponse(w, "tenant_id is required", http.StatusBadRequest, nil)
 		return
 	}
@@ -3145,7 +3170,7 @@ func mcpCheckOutputHandler(w http.ResponseWriter, r *http.Request) {
 
 	outcome := evaluateOutputPolicies(ctx,
 		tenantID, userID, req.ConnectorType,
-		req.ConnectorType, /* toolIdentity: advisory plane, caller-sent tool identity (#2801) */
+		req.Tool, /* toolIdentity: advisory plane, caller-sent tool identity (#2801, #2904, #2955) — distinct from ConnectorType/server; empty ⇒ full (fail-closed) evaluation, no fallback */
 		req.ResponseData, req.Message, req.Metadata, req.RowCount, checkExfiltration, true /* isGateway: check-output is a PEP/gateway caller */)
 
 	auditEntry.ExfilRowsReturned = req.RowCount
@@ -3191,7 +3216,8 @@ func mcpCheckOutputHandler(w http.ResponseWriter, r *http.Request) {
 			fmt.Sprintf("%d", user.ID), user.Role,
 			"mcp_check_output", fmt.Sprintf("mcp check-output: %s", req.ConnectorType), "",
 			mcpVerdictRedacted, outPolicyIDs, outReasons, outcome.RedactedFieldNames(),
-			traceIDFromHeader(r.Header.Get("traceparent")))
+			traceIDFromHeader(r.Header.Get("traceparent")),
+			req.ConnectorType, req.Tool) // #2955: tool_server, tool_name
 	} else {
 		recordDecideDecision(ctx, decisionID, orgID, tenantID, DecisionStageTool,
 			outVerdict, outPolicyIDs, time.Since(startTime).Milliseconds(), outReasons,
@@ -3208,6 +3234,8 @@ func mcpCheckOutputHandler(w http.ResponseWriter, r *http.Request) {
 				// the proxy/gateway propagates a W3C traceparent across the hops. Absent
 				// header → "" → singleton, preserving the chronological-only behavior.
 				correlationID: traceIDFromHeader(r.Header.Get("traceparent")),
+				toolServer:    req.ConnectorType, // #2955: tool_server (server axis)
+				toolName:      req.Tool,          // #2955: tool_name (sub-tool axis)
 			})
 	}
 
