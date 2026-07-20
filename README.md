@@ -6,6 +6,12 @@ It operates inside the execution path between your workflow logic and model or t
 
 It runs self-hosted (Docker or Kubernetes), with SDKs for **Python**, **TypeScript**, **Go**, **Java**, and **Rust** (preview), plus governance plugins for **OpenClaw**, **Claude Code**, **Claude Desktop**, **Cursor**, **Codex**, **Google ADK**, **n8n**, and **LiteLLM**.
 
+## Repository Role
+
+This is the BukuWarung fork of the AxonFlow product/source repository. Use it for platform, SDK, migration, docs, tests, and application source changes.
+
+For Docker Compose, AWS ECS/Fargate deployment, staging operations, fleet deployment artifacts, and image digest upgrades, use [`bukuwarung/axonflow-install`](https://github.com/bukuwarung/axonflow-install). A source change reaches staging only after new AxonFlow images are built and `axonflow-install` is updated with the new digests.
+
 > **Upgrade strongly recommended.** AxonFlow ships substantial monthly security and quality hardening; staying on the latest major is the security-supported release line. [Latest release](https://github.com/getaxonflow/axonflow/releases/latest) · [Security advisories](https://github.com/getaxonflow/axonflow/security/advisories)
 
 ## Why AxonFlow Exists
