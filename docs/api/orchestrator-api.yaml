@@ -2374,11 +2374,24 @@ paths:
       tags:
         - Dynamic Policies
       summary: List active dynamic policies
-      description: Returns all active dynamic policies
+      description: |
+        Returns the active dynamic policies visible to the CALLING tenant:
+        the tenant's own policies plus the shared global/default baseline.
+        Policies owned by other tenants are never returned in the same
+        response, and requests without a resolvable tenant are rejected
+        with 401 (fail closed).
+
+        The tenant scope is read from the `X-Tenant-ID` header. When the
+        request arrives through the AxonFlow Agent, that header is set from
+        the validated credential and overwrites any client-supplied value,
+        so the caller cannot choose the scope. The orchestrator itself does
+        not authenticate this route, so a caller with direct network access
+        to the orchestrator can name a tenant — deploy the orchestrator on a
+        private network behind the Agent.
       operationId: listDynamicPolicies
       responses:
         '200':
-          description: List of dynamic policies
+          description: List of dynamic policies visible to the calling tenant
           content:
             application/json:
               schema:
@@ -2408,6 +2421,8 @@ paths:
                   actions:
                     - type: "rate_limit"
                       limit: 10000
+        '401':
+          description: Tenant scope could not be resolved (missing gateway-stamped X-Tenant-ID); the endpoint fails closed and returns no policy data
 
   /api/v1/policies/test:
     post:
@@ -2490,6 +2505,20 @@ paths:
         identity receive an empty `entries` array. The role/scope is trusted
         only over the internal agent→orchestrator proxy-auth channel, never a
         client-forwarded header.
+
+        **Single-operator deployments (#3060):** `DEPLOYMENT_MODE=community`
+        reads tenant-wide unconditionally, and `DEPLOYMENT_MODE=community-saas`
+        reads tenant-wide for requests that arrived over the agent gateway
+        (proven by the internal proxy-auth token) — in that mode the
+        organization, tenant and credential are one `cs_<uuid>`, so tenant-wide
+        is that single evaluator's own data. A community-saas request that
+        reaches the orchestrator directly stays least-privilege. Read scope is
+        a separate axis from administrative authority: a community-saas caller
+        reads tenant-wide here and is still denied (403) the whole-tenant
+        compliance exports and the cost/usage/execution family.
+
+        **Method:** this endpoint is **POST-only** (its criteria are a JSON
+        body). A `GET` returns **405** with `Allow: POST, OPTIONS`.
       operationId: searchAuditLogs
       parameters:
         - $ref: '#/components/parameters/TenantIDHeader'
@@ -2513,6 +2542,9 @@ paths:
             Audit search results. `total` is the true pre-LIMIT match count
             for the filters, so callers can paginate with `limit`/`offset`.
             `entries` is always a JSON array (`[]` when empty, never `null`).
+          headers:
+            X-Axonflow-Read-Scope:
+              $ref: '#/components/headers/XAxonflowReadScope'
           content:
             application/json:
               schema:
@@ -2593,7 +2625,14 @@ paths:
               end_time: "2026-04-01T00:00:00Z"
       responses:
         '200':
-          description: Compliance summary
+          description: |
+            Compliance summary. A fail-closed read (`X-Axonflow-Read-Scope:
+            none`) returns the zero-events summary, whose `compliance_score`
+            of 100 reads as "all clear" — the header is what tells the two
+            apart.
+          headers:
+            X-Axonflow-Read-Scope:
+              $ref: '#/components/headers/XAxonflowReadScope'
           content:
             application/json:
               schema:
@@ -2700,6 +2739,9 @@ paths:
       responses:
         '200':
           description: Tenant audit logs
+          headers:
+            X-Axonflow-Read-Scope:
+              $ref: '#/components/headers/XAxonflowReadScope'
           content:
             application/json:
               schema:
@@ -2897,6 +2939,8 @@ paths:
             policy_decision, request_type, query, response_sample, provider,
             model, response_time_ms, correlation_id, session_id.
           headers:
+            X-Axonflow-Read-Scope:
+              $ref: '#/components/headers/XAxonflowReadScope'
             X-Audit-Export-Truncated:
               description: Present (value `true`) when the 50,000-row cap was hit
               schema:
@@ -2993,7 +3037,13 @@ paths:
               end_time: "2026-06-30T23:59:59Z"
       responses:
         '200':
-          description: Per-action report
+          description: |
+            Per-action report. A fail-closed read (`X-Axonflow-Read-Scope:
+            none`) returns the seeded all-zeroes report, which has the same
+            shape as "no rows in the window".
+          headers:
+            X-Axonflow-Read-Scope:
+              $ref: '#/components/headers/XAxonflowReadScope'
           content:
             application/json:
               schema:
@@ -3100,6 +3150,9 @@ paths:
       responses:
         '200':
           description: Session summary buckets
+          headers:
+            X-Axonflow-Read-Scope:
+              $ref: '#/components/headers/XAxonflowReadScope'
           content:
             application/json:
               schema:
@@ -3148,7 +3201,15 @@ paths:
         tenant returns 404 (not 403), so the endpoint cannot be used as a
         cross-tenant existence oracle. Literal `/api/v1/audit/*` routes
         (search, export, report, session-summary, tenant, tool-call) are
-        matched before this parameterized path.
+        matched before this parameterized path — including `GET
+        /api/v1/audit/search`, which answers **405** rather than being
+        swallowed here as an id of `"search"` (#3060).
+
+        **Role-scoped reads (#2922):** a non-tenant-wide caller may fetch only
+        their own rows; a record belonging to another user returns the same
+        404 as a missing one (non-oracle). See
+        `POST /api/v1/audit/search` for the deployment-mode carve-outs.
+
       operationId: getAuditLogById
       parameters:
         - name: id
@@ -3161,6 +3222,9 @@ paths:
       responses:
         '200':
           description: Full audit entry
+          headers:
+            X-Axonflow-Read-Scope:
+              $ref: '#/components/headers/XAxonflowReadScope'
           content:
             application/json:
               schema:
@@ -3178,7 +3242,15 @@ paths:
               schema:
                 $ref: '#/components/schemas/ErrorResponse'
         '404':
-          description: Audit record not found (or belongs to another tenant)
+          description: |
+            Audit record not found (or belongs to another tenant, or is
+            outside the caller's read scope). Deliberately the same body in
+            all three cases so the endpoint is not an existence oracle —
+            `X-Axonflow-Read-Scope` is the operator-side channel that tells
+            them apart.
+          headers:
+            X-Axonflow-Read-Scope:
+              $ref: '#/components/headers/XAxonflowReadScope'
           content:
             application/json:
               schema:
@@ -3306,6 +3378,9 @@ paths:
       responses:
         '200':
           description: Override list
+          headers:
+            X-Axonflow-Read-Scope:
+              $ref: '#/components/headers/XAxonflowReadScope'
           content:
             application/json:
               schema:
@@ -3351,6 +3426,9 @@ paths:
       responses:
         '200':
           description: Override detail
+          headers:
+            X-Axonflow-Read-Scope:
+              $ref: '#/components/headers/XAxonflowReadScope'
           content:
             application/json:
               schema:
@@ -3362,7 +3440,14 @@ paths:
               schema:
                 $ref: '#/components/schemas/ErrorResponse'
         '404':
-          description: Override not found
+          description: |
+            Override not found — also returned when the override exists but
+            was created by another user and the caller is scoped to
+            `own-rows`. Same body in both cases (non-oracle);
+            `X-Axonflow-Read-Scope` distinguishes them.
+          headers:
+            X-Axonflow-Read-Scope:
+              $ref: '#/components/headers/XAxonflowReadScope'
           content:
             application/json:
               schema:
@@ -3455,7 +3540,10 @@ paths:
         decisions; every other role lists only their own (rows attributed to
         their identity). A caller with no resolvable per-user identity gets an
         empty list. The role/scope is trusted only over the internal
-        proxy-auth channel.
+        proxy-auth channel. `DEPLOYMENT_MODE=community` lists tenant-wide, and
+        `community-saas` lists tenant-wide over the agent gateway — see
+        `POST /api/v1/audit/search` for the single-operator rationale (#3060).
+
       operationId: listDecisions
       parameters:
         - $ref: '#/components/parameters/TenantIDHeader'
@@ -3495,6 +3583,9 @@ paths:
       responses:
         '200':
           description: Decision list (`decisions` is `[]` when empty, never `null`)
+          headers:
+            X-Axonflow-Read-Scope:
+              $ref: '#/components/headers/XAxonflowReadScope'
           content:
             application/json:
               schema:
@@ -3564,6 +3655,9 @@ paths:
       responses:
         '200':
           description: Decision explanation
+          headers:
+            X-Axonflow-Read-Scope:
+              $ref: '#/components/headers/XAxonflowReadScope'
           content:
             application/json:
               schema:
@@ -3587,7 +3681,16 @@ paths:
               schema:
                 $ref: '#/components/schemas/ErrorResponse'
         '404':
-          description: Decision not found or past retention window
+          description: |
+            Decision not found, past the retention window, belongs to another
+            tenant, or belongs to another user while the caller is scoped to
+            `own-rows`. All four return the same body (non-oracle);
+            `X-Axonflow-Read-Scope` is what separates a scoping outcome from a
+            genuinely missing decision — the "explain fails on a decision the
+            platform produced seconds ago" symptom.
+          headers:
+            X-Axonflow-Read-Scope:
+              $ref: '#/components/headers/XAxonflowReadScope'
           content:
             application/json:
               schema:
@@ -3667,8 +3770,15 @@ paths:
         - Multiple export formats (JSON, CSV, XML)
         - Optional PII redaction for external auditors
 
-        Large exports are processed asynchronously. Poll the export status endpoint
-        to check completion and get the download URL.
+        **This endpoint is SYNCHRONOUS.** The export data is collected and returned
+        in this response; there is no job to poll and no separate download URL.
+        (An earlier version of this text said large exports were processed
+        asynchronously and told callers to poll a status endpoint. That was never
+        true - the status route queried a table no migration creates, so it
+        returned 500 on every deployment. See #3246.)
+
+        For an ASYNCHRONOUS, downloadable regulatory artifact use
+        `POST /api/v1/compliance/reports` with `regulator=sebi`.
 
         **5-Year Retention**: Per SEBI AI/ML Guidelines, all audit data is retained
         for minimum 5 years (1825 days).
@@ -3712,37 +3822,56 @@ paths:
     get:
       tags:
         - SEBI Compliance
-      summary: Get export status
+      summary: Get export status (not implemented)
       description: |
-        Get the status of an asynchronous SEBI audit export.
-        When status is "completed", the download_url will be provided.
+        **Always returns 501.** SEBI audit export is SYNCHRONOUS:
+        `POST /api/v1/sebi/audit/export` returns the data in its own response,
+        so there is no export job to poll and no status to report.
+
+        This route previously queried a table (`sebi_audit_exports`) that no
+        migration creates and nothing ever writes to, so it returned 500 on
+        every deployment. It now states its actual status rather than failing
+        (#3246).
+
+        For an ASYNCHRONOUS, downloadable regulatory artifact use
+        `POST /api/v1/compliance/reports` with `regulator=sebi`, then poll
+        `GET /api/v1/compliance/reports/{id}` and download via
+        `GET /api/v1/compliance/reports/{id}/download`.
       operationId: getSEBIExportStatus
+      deprecated: true
       parameters:
         - name: export_id
           in: path
           required: true
-          description: Export ID from the export request
+          description: Ignored. Retained so the route shape is unchanged.
           schema:
             type: string
           example: "exp_abc123"
       responses:
-        '200':
-          description: Export status
+        '501':
+          description: |
+            Not implemented. SEBI audit export is synchronous, so there is no
+            job to poll.
           content:
             application/json:
               schema:
-                $ref: '#/components/schemas/SEBIAuditExportResponse'
+                $ref: '#/components/schemas/ErrorResponse'
               example:
-                export_id: "exp_abc123"
-                status: "completed"
-                framework: "SEBI_DPDP_COMBINED"
-                download_url: "/api/v1/sebi/audit/export/exp_abc123/download"
-                expires_at: "2024-12-08T14:00:00Z"
-                summary:
-                  total_records: 15420
-                  compliance_score: 85.5
-        '404':
-          description: Export not found
+                error_code: "ASYNC_EXPORT_NOT_IMPLEMENTED"
+                error: >-
+                  SEBI audit export is synchronous: POST /api/v1/sebi/audit/export returns the data
+                  in the response, so there is no export job to poll and no status to report.
+                  For an asynchronous, downloadable regulatory artifact use
+                  POST /api/v1/compliance/reports with regulator=sebi, then poll
+                  GET /api/v1/compliance/reports/{id}.
+        '400':
+          description: Export ID is required
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+        '401':
+          description: Missing tenant ID
           content:
             application/json:
               schema:
@@ -3840,21 +3969,55 @@ paths:
         - OJK Compliance
       summary: Export OJK audit data
       description: |
-        Export audit data for OJK/BI regulatory submission. Supports:
-        - Compliance frameworks: `OJK_AI_GOVERNANCE`, `UU_PDP`, `BI_PJP`,
-          `OJK_BI_COMBINED` (default)
-        - Data types: policy_violations, llm_calls, decision_chain,
-          cross_border_transfers, breach_notifications, all (default).
-          `hitl_oversight` and `pii_redactions` are accepted by request
-          validation but are **not implemented** by the export service —
-          requesting them (or expecting them under `all`) yields no rows
-          and no error (no `queryHITLRecords`/`queryPIIRedactions` exists
-          in `ojk_audit_export_service.go`).
-        - Formats: json (default), csv, xml
+        Export audit data for OJK/BI regulatory submission.
+
+        **Compliance frameworks** — the label SELECTS the report sections when
+        `data_types` is omitted (#3242). It is not a cosmetic tag:
+
+        | Framework | Sections, in report order |
+        |---|---|
+        | `OJK_AI_GOVERNANCE` | policy_violations, llm_calls, decision_chain, hitl_oversight |
+        | `UU_PDP` | pii_redactions, cross_border_transfers, breach_notifications, policy_violations |
+        | `BI_PJP` | decision_chain, hitl_oversight, pii_redactions, cross_border_transfers, breach_notifications |
+        | `OJK_BI_COMBINED` (default) | all seven sections |
+
+        **Data types**: policy_violations, llm_calls, decision_chain,
+        hitl_oversight, pii_redactions, cross_border_transfers,
+        breach_notifications, all. All seven are implemented. An explicitly
+        requested section outside the selected framework's scope is still
+        served, flagged `in_framework_scope: false`. An UNKNOWN data type
+        produces an explicit per-section error — never a silent empty section.
+
+        **Formats**: `format` is accepted as json (default), csv or xml, but this
+        endpoint PRODUCES ONLY JSON: the response is written with
+        `Content-Type: application/json` and the data is inline. When csv or xml
+        is requested the response reports `format: json` (what the body IS),
+        echoes the ask in `requested_format`, and explains the difference in
+        `format_note`. It does NOT label a JSON body as csv (#3242) - a
+        regulator artifact that misstates its own encoding is worse than one
+        that refuses. Rendered output is the compliance-report facade's job.
+
+        **`report_state`** is carried per section and rolled up on the summary:
+        `populated` (served, has records), `enabled_empty` (served, honestly
+        zero for this organization and window), `not_available` (could not be
+        served at all — always paired with an `error` and an `error_kind` of
+        `section_not_implemented` / `store_absent` / `query_failed`). Read
+        `report_state`, not the presence of a JSON key: every data array is
+        `omitempty`, so absence alone is ambiguous.
+
+        Sections are capped at 100,000 records; a section that reaches the cap
+        says so in its `note`.
 
         The date range may span at most 5 years, matching the OJK 5-year
-        (1825-day) retention requirement. The export runs synchronously and
-        returns `status: completed` with the data inline.
+        (1825-day) retention requirement. `start_date` and `end_date` are dates
+        (`YYYY-MM-DD`) and the window is inclusive of the whole final day, **in
+        UTC at both ends** — a request for `2026-08-03` covers
+        2026-08-03T00:00Z..T23:59Z, which is 07:00..07:00 WIB. The export runs
+        synchronously and returns `status: completed` with the data inline.
+
+        `metadata.export_version` is `2.0.0` for this contract. A `1.0.0`
+        consumer that inferred "module not enabled" from an empty body must move
+        to `report_state`.
 
         **Enterprise Feature**: Available only for Indonesian financial
         services deployments.
@@ -3864,15 +4027,21 @@ paths:
           in: header
           required: false
           description: |
-            Tenant identifier. The OJK module falls back to X-Org-ID when
-            absent; a request carrying neither header is rejected with 400
-            (code `missing_tenant`).
+            Deprecated fallback. Every OJK route is scoped to the caller's
+            ORGANIZATION via `X-Org-ID` (#3242); `X-Tenant-ID` is used only when
+            `X-Org-ID` is absent, which covers single-identifier deployments
+            where the two values are the same. When both are present the
+            organization wins. A request carrying neither header, or a
+            whitespace-only value, is rejected with 400 (code `missing_org`).
           schema:
             type: string
         - name: X-Org-ID
           in: header
           required: false
-          description: Fallback tenant identifier when X-Tenant-ID is absent
+          description: |
+            Organization identifier — the authoritative OJK scope. Set by the
+            AxonFlow agent from the validated client credential on every proxied
+            route, so a caller cannot choose it.
           schema:
             type: string
       requestBody:
@@ -3954,15 +4123,21 @@ paths:
           in: header
           required: false
           description: |
-            Tenant identifier. The OJK module falls back to X-Org-ID when
-            absent; a request carrying neither header is rejected with 400
-            (code `missing_tenant`).
+            Deprecated fallback. Every OJK route is scoped to the caller's
+            ORGANIZATION via `X-Org-ID` (#3242); `X-Tenant-ID` is used only when
+            `X-Org-ID` is absent, which covers single-identifier deployments
+            where the two values are the same. When both are present the
+            organization wins. A request carrying neither header, or a
+            whitespace-only value, is rejected with 400 (code `missing_org`).
           schema:
             type: string
         - name: X-Org-ID
           in: header
           required: false
-          description: Fallback tenant identifier when X-Tenant-ID is absent
+          description: |
+            Organization identifier — the authoritative OJK scope. Set by the
+            AxonFlow agent from the validated client credential on every proxied
+            route, so a caller cannot choose it.
           schema:
             type: string
       responses:
@@ -4012,25 +4187,32 @@ paths:
           in: header
           required: false
           description: |
-            Tenant identifier. The OJK module falls back to X-Org-ID when
-            absent; a request carrying neither header is rejected with 400
-            (code `missing_tenant`).
+            Deprecated fallback. Every OJK route is scoped to the caller's
+            ORGANIZATION via `X-Org-ID` (#3242); `X-Tenant-ID` is used only when
+            `X-Org-ID` is absent, which covers single-identifier deployments
+            where the two values are the same. When both are present the
+            organization wins. A request carrying neither header, or a
+            whitespace-only value, is rejected with 400 (code `missing_org`).
           schema:
             type: string
         - name: X-Org-ID
           in: header
           required: false
-          description: Fallback tenant identifier when X-Tenant-ID is absent
+          description: |
+            Organization identifier — the authoritative OJK scope. Set by the
+            AxonFlow agent from the validated client credential on every proxied
+            route, so a caller cannot choose it.
           schema:
             type: string
         - name: data_types
           in: query
           required: false
           description: |
-            Comma-separated list of data types to report on. ⚠️ Parsed but
-            **ignored** by the current implementation — `GetRetentionStatus`
-            never reads it and always returns an empty `data_types` array
-            (`ojk_audit_export_service.go`).
+            Comma-separated list of data types to report on. Narrows the report;
+            omit it for every data type. Each entry is derived from its backing
+            store (count, oldest and newest record, and a status of `compliant` /
+            `short_history` / `no_data` / `unknown`); a store that cannot be read
+            reports `unknown`, never `no_data` (#3242).
           schema:
             type: string
           example: "policy_violations,llm_calls"
@@ -4042,7 +4224,7 @@ paths:
               schema:
                 $ref: '#/components/schemas/OJKRetentionStatusResponse'
         '400':
-          description: Missing tenant headers (code `missing_tenant`)
+          description: Missing organization scope (code `missing_org`)
           content:
             application/json:
               schema:
@@ -4062,7 +4244,18 @@ paths:
       description: |
         Validates readiness for an OJK regulatory audit across five checks:
         Data Retention, PII Detection, Human Oversight, Audit Logging, and
-        Breach Notification. Returns a 0-100 score; `ready` is true at 80+.
+        Breach Notification.
+
+        Every check QUERIES the state it names or reports `unknown` (#3242) —
+        four of the five were previously unconditional `pass` literals. Check
+        statuses are `pass`, `warning`, `fail` or `unknown`, and each carries
+        `details` describing what was OBSERVED plus an `observed` measurement.
+
+        Scoring: a pass counts 1, a warning 0.5, a failure 0, and an `unknown`
+        check scores ZERO while STILL counting in the denominator — an
+        unobservable dimension must drag the score down, never inflate it.
+        `measured_checks` / `unknown_checks` expose the split. `ready` requires
+        no failures, **no unknowns**, and a score of at least 80.
 
         **Enterprise Feature**.
       operationId: getOJKComplianceReadiness
@@ -4071,15 +4264,21 @@ paths:
           in: header
           required: false
           description: |
-            Tenant identifier. The OJK module falls back to X-Org-ID when
-            absent; a request carrying neither header is rejected with 400
-            (code `missing_tenant`).
+            Deprecated fallback. Every OJK route is scoped to the caller's
+            ORGANIZATION via `X-Org-ID` (#3242); `X-Tenant-ID` is used only when
+            `X-Org-ID` is absent, which covers single-identifier deployments
+            where the two values are the same. When both are present the
+            organization wins. A request carrying neither header, or a
+            whitespace-only value, is rejected with 400 (code `missing_org`).
           schema:
             type: string
         - name: X-Org-ID
           in: header
           required: false
-          description: Fallback tenant identifier when X-Tenant-ID is absent
+          description: |
+            Organization identifier — the authoritative OJK scope. Set by the
+            AxonFlow agent from the validated client credential on every proxied
+            route, so a caller cannot choose it.
           schema:
             type: string
       responses:
@@ -4101,7 +4300,7 @@ paths:
                     description: "Indonesian PII patterns active"
                     status: "pass"
         '400':
-          description: Missing tenant headers (code `missing_tenant`)
+          description: Missing organization scope (code `missing_org`)
           content:
             application/json:
               schema:
@@ -4133,15 +4332,21 @@ paths:
           in: header
           required: false
           description: |
-            Tenant identifier. The OJK module falls back to X-Org-ID when
-            absent; a request carrying neither header is rejected with 400
-            (code `missing_tenant`).
+            Deprecated fallback. Every OJK route is scoped to the caller's
+            ORGANIZATION via `X-Org-ID` (#3242); `X-Tenant-ID` is used only when
+            `X-Org-ID` is absent, which covers single-identifier deployments
+            where the two values are the same. When both are present the
+            organization wins. A request carrying neither header, or a
+            whitespace-only value, is rejected with 400 (code `missing_org`).
           schema:
             type: string
         - name: X-Org-ID
           in: header
           required: false
-          description: Fallback tenant identifier when X-Tenant-ID is absent
+          description: |
+            Organization identifier — the authoritative OJK scope. Set by the
+            AxonFlow agent from the validated client credential on every proxied
+            route, so a caller cannot choose it.
           schema:
             type: string
       requestBody:
@@ -4202,15 +4407,21 @@ paths:
           in: header
           required: false
           description: |
-            Tenant identifier. The OJK module falls back to X-Org-ID when
-            absent; a request carrying neither header is rejected with 400
-            (code `missing_tenant`).
+            Deprecated fallback. Every OJK route is scoped to the caller's
+            ORGANIZATION via `X-Org-ID` (#3242); `X-Tenant-ID` is used only when
+            `X-Org-ID` is absent, which covers single-identifier deployments
+            where the two values are the same. When both are present the
+            organization wins. A request carrying neither header, or a
+            whitespace-only value, is rejected with 400 (code `missing_org`).
           schema:
             type: string
         - name: X-Org-ID
           in: header
           required: false
-          description: Fallback tenant identifier when X-Tenant-ID is absent
+          description: |
+            Organization identifier — the authoritative OJK scope. Set by the
+            AxonFlow agent from the validated client credential on every proxied
+            route, so a caller cannot choose it.
           schema:
             type: string
       requestBody:
@@ -4274,15 +4485,21 @@ paths:
           in: header
           required: false
           description: |
-            Tenant identifier. The OJK module falls back to X-Org-ID when
-            absent; a request carrying neither header is rejected with 400
-            (code `missing_tenant`).
+            Deprecated fallback. Every OJK route is scoped to the caller's
+            ORGANIZATION via `X-Org-ID` (#3242); `X-Tenant-ID` is used only when
+            `X-Org-ID` is absent, which covers single-identifier deployments
+            where the two values are the same. When both are present the
+            organization wins. A request carrying neither header, or a
+            whitespace-only value, is rejected with 400 (code `missing_org`).
           schema:
             type: string
         - name: X-Org-ID
           in: header
           required: false
-          description: Fallback tenant identifier when X-Tenant-ID is absent
+          description: |
+            Organization identifier — the authoritative OJK scope. Set by the
+            AxonFlow agent from the validated client credential on every proxied
+            route, so a caller cannot choose it.
           schema:
             type: string
       responses:
@@ -4299,7 +4516,7 @@ paths:
               example:
                 flipped_overdue: 2
         '400':
-          description: Missing tenant headers (code `missing_tenant`)
+          description: Missing organization scope (code `missing_org`)
           content:
             application/json:
               schema:
@@ -4328,15 +4545,21 @@ paths:
           in: header
           required: false
           description: |
-            Tenant identifier. The OJK module falls back to X-Org-ID when
-            absent; a request carrying neither header is rejected with 400
-            (code `missing_tenant`).
+            Deprecated fallback. Every OJK route is scoped to the caller's
+            ORGANIZATION via `X-Org-ID` (#3242); `X-Tenant-ID` is used only when
+            `X-Org-ID` is absent, which covers single-identifier deployments
+            where the two values are the same. When both are present the
+            organization wins. A request carrying neither header, or a
+            whitespace-only value, is rejected with 400 (code `missing_org`).
           schema:
             type: string
         - name: X-Org-ID
           in: header
           required: false
-          description: Fallback tenant identifier when X-Tenant-ID is absent
+          description: |
+            Organization identifier — the authoritative OJK scope. Set by the
+            AxonFlow agent from the validated client credential on every proxied
+            route, so a caller cannot choose it.
           schema:
             type: string
       responses:
@@ -4357,7 +4580,7 @@ paths:
                 overdue_breach_notifications: 0
                 last_updated: "2026-07-10T09:00:00Z"
         '400':
-          description: Missing tenant headers (code `missing_tenant`)
+          description: Missing organization scope (code `missing_org`)
           content:
             application/json:
               schema:
@@ -6334,7 +6557,19 @@ paths:
       description: List audit exports with retention per RBI FREE-AI requirements.
       operationId: listAuditExports
       parameters:
-        - $ref: '#/components/parameters/OrgIDQuery'
+        - name: X-Org-ID
+          in: header
+          required: true
+          description: |
+            Organization scope for this request. Stamped by the AxonFlow Agent
+            gateway from the cryptographically validated client credential
+            (Set, not Add, so any client-supplied value is overwritten), so it
+            is not client-selectable and carries no cross-org override
+            capability on this route. The orchestrator fails closed with 401
+            when it is absent or blank; there is no query-string equivalent.
+          schema:
+            type: string
+          example: "travel-us"
         - $ref: '#/components/parameters/LimitParam'
         - $ref: '#/components/parameters/OffsetParam'
       responses:
@@ -6355,6 +6590,8 @@ paths:
                     type: integer
                   offset:
                     type: integer
+        '401':
+          $ref: '#/components/responses/Unauthorized'
     post:
       tags:
         - RBI Compliance
@@ -6364,7 +6601,19 @@ paths:
         When cloud storage is configured, exports are uploaded to S3/GCS/Azure and a presigned download URL is generated.
       operationId: createAuditExport
       parameters:
-        - $ref: '#/components/parameters/OrgIDQuery'
+        - name: X-Org-ID
+          in: header
+          required: true
+          description: |
+            Organization scope for this request. Stamped by the AxonFlow Agent
+            gateway from the cryptographically validated client credential
+            (Set, not Add, so any client-supplied value is overwritten), so it
+            is not client-selectable and carries no cross-org override
+            capability on this route. The orchestrator fails closed with 401
+            when it is absent or blank; there is no query-string equivalent.
+          schema:
+            type: string
+          example: "travel-us"
       requestBody:
         required: true
         content:
@@ -6388,6 +6637,8 @@ paths:
                     $ref: '#/components/schemas/RBIAuditExport'
         '400':
           $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
 
   /api/v1/rbi/audit-exports/{export_id}:
     get:
@@ -6402,7 +6653,19 @@ paths:
           required: true
           schema:
             type: string
-        - $ref: '#/components/parameters/OrgIDQuery'
+        - name: X-Org-ID
+          in: header
+          required: true
+          description: |
+            Organization scope for this request. Stamped by the AxonFlow Agent
+            gateway from the cryptographically validated client credential
+            (Set, not Add, so any client-supplied value is overwritten), so it
+            is not client-selectable and carries no cross-org override
+            capability on this route. The orchestrator fails closed with 401
+            when it is absent or blank; there is no query-string equivalent.
+          schema:
+            type: string
+          example: "travel-us"
       responses:
         '200':
           description: Export details
@@ -6413,6 +6676,8 @@ paths:
                 properties:
                   export:
                     $ref: '#/components/schemas/RBIAuditExport'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
         '404':
           $ref: '#/components/responses/NotFound'
     delete:
@@ -6427,10 +6692,24 @@ paths:
           required: true
           schema:
             type: string
-        - $ref: '#/components/parameters/OrgIDQuery'
+        - name: X-Org-ID
+          in: header
+          required: true
+          description: |
+            Organization scope for this request. Stamped by the AxonFlow Agent
+            gateway from the cryptographically validated client credential
+            (Set, not Add, so any client-supplied value is overwritten), so it
+            is not client-selectable and carries no cross-org override
+            capability on this route. The orchestrator fails closed with 401
+            when it is absent or blank; there is no query-string equivalent.
+          schema:
+            type: string
+          example: "travel-us"
       responses:
         '204':
           description: Export deleted
+        '401':
+          $ref: '#/components/responses/Unauthorized'
         '404':
           $ref: '#/components/responses/NotFound'
 
@@ -6449,7 +6728,19 @@ paths:
           required: true
           schema:
             type: string
-        - $ref: '#/components/parameters/OrgIDQuery'
+        - name: X-Org-ID
+          in: header
+          required: true
+          description: |
+            Organization scope for this request. Stamped by the AxonFlow Agent
+            gateway from the cryptographically validated client credential
+            (Set, not Add, so any client-supplied value is overwritten), so it
+            is not client-selectable and carries no cross-org override
+            capability on this route. The orchestrator fails closed with 401
+            when it is absent or blank; there is no query-string equivalent.
+          schema:
+            type: string
+          example: "travel-us"
       responses:
         '200':
           description: Export processed
@@ -6462,6 +6753,8 @@ paths:
                     $ref: '#/components/schemas/RBIAuditExport'
         '400':
           $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
         '404':
           $ref: '#/components/responses/NotFound'
 
@@ -7805,6 +8098,13 @@ paths:
                     type: integer
                   total_policies:
                     type: integer
+                    description: |
+                      Number of active policies visible to the calling tenant —
+                      its own plus the shared global/default baseline.
+
+                      CHANGED: this previously counted every active policy in
+                      the deployment, across all tenants, which disclosed the
+                      deployment-wide policy count to every caller.
                   dry_run:
                     type: boolean
                     enum: [true]
@@ -8120,6 +8420,61 @@ paths:
           description: Feature requires Evaluation or Enterprise license
 
 components:
+  headers:
+    # Single source of truth for the RBAC read-scope diagnostic header
+    # (#2991 / #3060 / #3087). Referenced from every read that stamps it —
+    # the first three endpoints documented it as hand-repeated prose in their
+    # `description`, which is how the other eight silently went undocumented.
+    # Add the $ref here rather than a fourth copy of the paragraph.
+    XAxonflowReadScope:
+      description: |
+        RBAC read-scope diagnostic. Echoes the read scope the orchestrator
+        resolved server-side for this caller and applied to the query:
+
+        - `tenant` — the caller may read every user's rows within the
+          (header-forced) tenant: a validated `admin`/`owner` role over the
+          internal proxy-auth channel, the customer-portal's tenant-scope
+          assertion, or a single-operator deployment (`DEPLOYMENT_MODE=community`,
+          and `community-saas` for requests proven to have arrived over the
+          agent gateway — there the organization, tenant and credential are one
+          `cs_<uuid>`, so "tenant-wide" is that one evaluator's own data).
+        - `own-rows` — the caller has a validated per-user identity but no
+          tenant-wide authority, so the read was restricted to rows stamped
+          with their own canonical `user_email`.
+        - `none` — fail-closed. The caller presented neither tenant-wide
+          authority nor a per-user identity, so **zero rows** were returned.
+          The orchestrator also logs one diagnostic line on this path.
+
+        The header exists so that a `200` with an empty page — or a `404` on a
+        record that does exist — is distinguishable from a genuinely empty
+        trail. That ambiguity is what let a whole deployment read zero rows
+        without anyone noticing.
+
+        **Diagnostic only.** The response body is byte-for-byte unchanged by
+        its presence or value, and nothing keys authorization off it. It is a
+        RESPONSE header the orchestrator writes, never an input: a
+        client-supplied `X-Axonflow-Read-Scope` REQUEST header is stripped by
+        the agent gateway and is never trusted. Scope is derived from the
+        validated identity carried over the internal agent→orchestrator
+        proxy-auth channel.
+
+        Read scope is also a separate axis from administrative authority.
+        `tenant` here does not imply the caller may run whole-tenant compliance
+        exports or the cost/usage/execution family — those stay admin-gated and
+        still return 403.
+
+        Stamped before the handler writes its status line, so it is present on
+        any response produced after the scope is resolved (including the
+        deliberately non-oracle `404`s), and absent on requests rejected before
+        that point (e.g. a missing `X-Tenant-ID`).
+      schema:
+        type: string
+        enum:
+          - tenant
+          - own-rows
+          - none
+        example: tenant
+
   parameters:
     # Reusable header / query parameters referenced from path operations
     # via the standard OpenAPI components.parameters mechanism. Each
@@ -8187,17 +8542,6 @@ components:
         type: integer
         minimum: 0
         default: 0
-
-    OrgIDQuery:
-      name: org_id
-      in: query
-      required: false
-      description: |
-        Organization filter for list reads. Query-string form of the
-        X-Org-ID header used elsewhere — handlers fall back to the
-        authenticated org when omitted.
-      schema:
-        type: string
 
   schemas:
     HealthResponse:
@@ -8292,7 +8636,7 @@ components:
           additionalProperties:
             type: string
           example:
-            python: "8.5.1"
+            python: "9.0.0"
 
     PluginCompatInfo:
       type: object
@@ -13238,6 +13582,12 @@ components:
           type: string
           enum: [json, csv, xml]
           default: json
+          description: |
+            All three values are ACCEPTED. This endpoint PRODUCES only JSON:
+            a csv or xml request succeeds and returns the same JSON body, with
+            the response reporting `format: json`, echoing the ask in
+            `requested_format` and explaining it in `format_note`. It does NOT
+            label a JSON body as csv (#3242).
         framework:
           type: string
           enum: [OJK_AI_GOVERNANCE, UU_PDP, BI_PJP, OJK_BI_COMBINED]
@@ -13284,7 +13634,26 @@ components:
           enum: [OJK_AI_GOVERNANCE, UU_PDP, BI_PJP, OJK_BI_COMBINED]
         format:
           type: string
-          enum: [json, csv, xml]
+          enum: [json]
+          description: |
+            The format this response BODY is in, NOT the one that was
+            requested. Always `json`: this endpoint writes
+            `Content-Type: application/json` with the data inline, and no
+            renderer for csv or xml exists on it. Rendered output is the
+            compliance-report facade's job.
+        requested_format:
+          type: string
+          enum: [csv, xml]
+          description: |
+            Present ONLY when the caller asked for a format this endpoint
+            does not produce. Its presence is the signal that the body is
+            not what was requested. Absent on a json request.
+        format_note:
+          type: string
+          description: |
+            Prose explanation of the discrepancy, present exactly when
+            `requested_format` is. Exists so a human reading the artifact
+            does not have to infer it from two fields disagreeing.
         summary:
           type: object
           properties:

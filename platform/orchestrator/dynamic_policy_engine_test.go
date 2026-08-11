@@ -384,10 +384,10 @@ func TestApplyPolicyAction(t *testing.T) {
 	ctx := context.Background()
 
 	tests := []struct {
-		name           string
-		action         PolicyAction
-		req            OrchestratorRequest
-		initialResult  *PolicyEvaluationResult
+		name            string
+		action          PolicyAction
+		req             OrchestratorRequest
+		initialResult   *PolicyEvaluationResult
 		expectedAllowed bool
 		expectedActions int
 	}{
@@ -635,33 +635,58 @@ func TestCalculateRiskScore(t *testing.T) {
 	}
 }
 
-// TestPolicyCache tests cache operations
+// TestPolicyCache tests cache operations.
+//
+// #3142 inverted one assertion here. This test used to require
+// `retrieved == testValue` — pointer identity between the stored and the
+// returned verdict — which is precisely the property that let
+// ApplyOverrideToResult write one tenant's session override into the shared
+// cache entry every later caller reads. The requirement is now the opposite:
+// equal by value, distinct by pointer.
 func TestPolicyCache(t *testing.T) {
 	cache := NewPolicyCache(5 * time.Minute)
 	defer cache.Close()
 
 	// Test Set and Get
-	testKey := "test-key"
+	testKey := verdictCacheKey{OrgID: "org-a", TenantID: "tenant-a", Request: "test-key"}
 	testValue := &PolicyEvaluationResult{
-		Allowed:   false,
-		RiskScore: 0.9,
+		Allowed:         false,
+		RiskScore:       0.9,
+		AppliedPolicies: []string{"policy-1"},
 	}
 
 	cache.Set(testKey, testValue)
 
 	retrieved, found := cache.Get(testKey)
 	if !found {
-		t.Error("Expected to find cached value")
+		t.Fatal("Expected to find cached value")
 	}
 
-	if retrieved != testValue {
-		t.Error("Retrieved value does not match stored value")
+	if retrieved == testValue {
+		t.Error("Get returned the caller's own pointer — a caller mutating the result would mutate the cache entry")
+	}
+	if retrieved.Allowed != testValue.Allowed || retrieved.RiskScore != testValue.RiskScore {
+		t.Errorf("Retrieved value does not match stored value: got %+v, want %+v", retrieved, testValue)
+	}
+	if len(retrieved.AppliedPolicies) != 1 || retrieved.AppliedPolicies[0] != "policy-1" {
+		t.Errorf("AppliedPolicies not preserved through the copy: %v", retrieved.AppliedPolicies)
+	}
+	if &retrieved.AppliedPolicies[0] == &testValue.AppliedPolicies[0] {
+		t.Error("AppliedPolicies shares its backing array with the stored value — the copy is shallow")
 	}
 
 	// Test Get non-existent key
-	_, found = cache.Get("non-existent-key")
+	_, found = cache.Get(verdictCacheKey{OrgID: "org-a", TenantID: "tenant-a", Request: "non-existent-key"})
 	if found {
 		t.Error("Should not find non-existent key")
+	}
+
+	// A key differing ONLY in tenancy must be a different entry.
+	if _, found := cache.Get(verdictCacheKey{OrgID: "org-a", TenantID: "tenant-b", Request: "test-key"}); found {
+		t.Error("a different tenant hit tenant-a's cached verdict")
+	}
+	if _, found := cache.Get(verdictCacheKey{OrgID: "org-b", TenantID: "tenant-a", Request: "test-key"}); found {
+		t.Error("a different org hit org-a's cached verdict")
 	}
 }
 
@@ -928,10 +953,10 @@ func TestEvaluatePolicy(t *testing.T) {
 // TestLoadPoliciesFromDB tests database policy loading
 func TestLoadPoliciesFromDB(t *testing.T) {
 	tests := []struct {
-		name          string
-		setupMock     func(sqlmock.Sqlmock)
-		expectError   bool
-		expectCount   int
+		name        string
+		setupMock   func(sqlmock.Sqlmock)
+		expectError bool
+		expectCount int
 	}{
 		{
 			name: "Successfully load policies from database",
@@ -1164,19 +1189,24 @@ func TestLogAuditEvent_NilDatabase(t *testing.T) {
 // TestGetTenantSpecificPolicies tests tenant-specific policy filtering
 func TestGetTenantSpecificPolicies(t *testing.T) {
 	tests := []struct {
-		name          string
-		setupMock     func(sqlmock.Sqlmock, *DynamicPolicyEngine)
-		tenantID      string
-		expectCount   int
-		expectQuery   bool
+		name        string
+		setupMock   func(sqlmock.Sqlmock, *DynamicPolicyEngine)
+		tenantID    string
+		expectCount int
+		expectQuery bool
 	}{
 		{
 			name: "Successfully filter tenant policies",
 			setupMock: func(mock sqlmock.Sqlmock, engine *DynamicPolicyEngine) {
-				// Mock the COUNT query
+				// Mock the COUNT query — org-scoped (#3048).
+				mock.ExpectBegin()
+				mock.ExpectExec("SELECT set_config\\('app.current_org_id', \\$1, true\\)").
+					WithArgs("tenant-1").
+					WillReturnResult(sqlmock.NewResult(0, 0))
 				mock.ExpectQuery("SELECT COUNT\\(\\*\\) FROM dynamic_policies").
 					WithArgs("tenant-1").
 					WillReturnRows(sqlmock.NewRows([]string{"count"}).AddRow(2))
+				mock.ExpectCommit()
 
 				// Add test policies to engine
 				engine.policies = []DynamicPolicy{
@@ -1192,9 +1222,14 @@ func TestGetTenantSpecificPolicies(t *testing.T) {
 		{
 			name: "No policies for tenant",
 			setupMock: func(mock sqlmock.Sqlmock, engine *DynamicPolicyEngine) {
+				mock.ExpectBegin()
+				mock.ExpectExec("SELECT set_config\\('app.current_org_id', \\$1, true\\)").
+					WithArgs("tenant-999").
+					WillReturnResult(sqlmock.NewResult(0, 0))
 				mock.ExpectQuery("SELECT COUNT\\(\\*\\) FROM dynamic_policies").
 					WithArgs("tenant-999").
 					WillReturnRows(sqlmock.NewRows([]string{"count"}).AddRow(0))
+				mock.ExpectCommit()
 
 				engine.policies = []DynamicPolicy{
 					{ID: "policy-1", TenantID: "tenant-1", Name: "Policy 1"},
@@ -1207,9 +1242,14 @@ func TestGetTenantSpecificPolicies(t *testing.T) {
 		{
 			name: "Database query fails - returns filtered policies anyway",
 			setupMock: func(mock sqlmock.Sqlmock, engine *DynamicPolicyEngine) {
+				mock.ExpectBegin()
+				mock.ExpectExec("SELECT set_config\\('app.current_org_id', \\$1, true\\)").
+					WithArgs("tenant-1").
+					WillReturnResult(sqlmock.NewResult(0, 0))
 				mock.ExpectQuery("SELECT COUNT\\(\\*\\) FROM dynamic_policies").
 					WithArgs("tenant-1").
 					WillReturnError(fmt.Errorf("query failed"))
+				mock.ExpectRollback()
 
 				engine.policies = []DynamicPolicy{
 					{ID: "policy-1", TenantID: "tenant-1", Name: "Policy 1"},
@@ -1240,7 +1280,7 @@ func TestGetTenantSpecificPolicies(t *testing.T) {
 			tt.setupMock(mock, engine)
 
 			// Execute
-			tenantPolicies := engine.getTenantSpecificPolicies(tt.tenantID)
+			tenantPolicies := engine.getTenantSpecificPolicies("", tt.tenantID)
 
 			// Verify count
 			if len(tenantPolicies) != tt.expectCount {
@@ -1269,7 +1309,7 @@ func TestGetTenantSpecificPolicies_NilDatabase(t *testing.T) {
 		dbAvailable: false,
 	}
 
-	result := engine.getTenantSpecificPolicies("tenant-1")
+	result := engine.getTenantSpecificPolicies("", "tenant-1")
 	if result != nil {
 		t.Error("Expected nil result when database is not available")
 	}
@@ -1486,8 +1526,8 @@ func TestGetFieldValue_MediaFields(t *testing.T) {
 				"has_pii":               true,
 				"pii_types":             []string{"email", "phone"},
 				"content_safe":          true,
-				"has_extracted_text":     true,
-				"extracted_text_length":  42,
+				"has_extracted_text":    true,
+				"extracted_text_length": 42,
 			},
 		},
 	}
@@ -1713,21 +1753,21 @@ func TestDatabaseDynamicPolicyEngine_StepGateEvaluation(t *testing.T) {
 	// StepInput: {"recipient_count": 5000, "tool": "email_sender", "action": "send_bulk"}
 	// These get merged as "step_input.recipient_count", "step_input.tool", etc.
 	contextData := map[string]interface{}{
-		"workflow_id":              "wf_test",
-		"workflow_name":            "support-automation",
-		"source":                   "api",
-		"step_id":                  "step-2",
-		"step_name":                "Send Email",
-		"step_type":                "tool_call",
-		"step_index":               2,
-		"model":                    "",
-		"provider":                 "",
-		"step_input.tool":          "email_sender",
-		"step_input.action":        "send_bulk",
+		"workflow_id":                "wf_test",
+		"workflow_name":              "support-automation",
+		"source":                     "api",
+		"step_id":                    "step-2",
+		"step_name":                  "Send Email",
+		"step_type":                  "tool_call",
+		"step_index":                 2,
+		"model":                      "",
+		"provider":                   "",
+		"step_input.tool":            "email_sender",
+		"step_input.action":          "send_bulk",
 		"step_input.recipient_count": float64(5000),
-		"step_input.subject":       "Support case update",
-		"tool_name":                "email_sender",
-		"tool_type":                "function",
+		"step_input.subject":         "Support case update",
+		"tool_name":                  "email_sender",
+		"tool_type":                  "function",
 	}
 
 	req := OrchestratorRequest{
@@ -1886,8 +1926,8 @@ func TestDatabaseDynamicPolicyEngine_CrossTenantCacheCollision(t *testing.T) {
 		},
 		Context: map[string]interface{}{
 			"step_input.recipient_count": float64(5000),
-			"step_input.tool":           "email_sender",
-			"tool_name":                 "email_sender",
+			"step_input.tool":            "email_sender",
+			"tool_name":                  "email_sender",
 		},
 	}
 

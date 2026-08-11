@@ -2,7 +2,7 @@
 
 **Last Updated:** February 2026
 
-**Platform Version:** v5.0.0 | **SDK Version:** v5.0.0
+**Platform Version:** 9.14.0 | **SDK Version:** 9.0.0
 
 Proxy Mode is the simplest way to add governance to your AI applications. AxonFlow acts as a proxy between your application and LLM providers, handling policy enforcement, PII detection, rate limiting, and audit logging automatically.
 
@@ -71,7 +71,7 @@ const response = await axonflow.protect(async () => {
 ```go
 import (
     "os"
-    "github.com/getaxonflow/axonflow-sdk-go/v8"
+    "github.com/getaxonflow/axonflow-sdk-go/v9"
 )
 
 client := axonflow.NewClient(axonflow.AxonFlowConfig{
@@ -110,7 +110,7 @@ async with AxonFlow(
 ### Java
 
 ```java
-import com.axonflow.sdk.AxonFlowClient;
+import com.getaxonflow.sdk.AxonFlowClient;
 
 AxonFlowClient client = AxonFlowClient.builder()
     .endpoint(System.getenv("AXONFLOW_AGENT_URL"))

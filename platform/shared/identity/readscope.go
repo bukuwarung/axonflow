@@ -36,15 +36,121 @@ const (
 
 	// ReadScopeTenant is the sole recognized HeaderReadScope value.
 	ReadScopeTenant = "tenant"
+
+	// HeaderAdminAuthority carries a plane-level ADMINISTRATIVE-authority
+	// assertion by an internal service that has already authorized the caller
+	// as an administrator of the tenant under its own access model. The only
+	// recognized value is AdminAuthorityAsserted; anything else is ignored.
+	//
+	// WHY THIS IS A SEPARATE HEADER FROM HeaderReadScope (#3241 round 2)
+	//
+	// Read scope and admin authority are two axes (see callerReadScope in
+	// platform/orchestrator/read_scope.go), and they were split there in #3060
+	// precisely so answering "how wide may this caller see?" could not also
+	// answer "is this caller an administrator?".
+	//
+	// The portal plane re-created the conflation one layer up: the orchestrator
+	// granted AdminAuthority on HeaderReadScope alone, and the portal stamps
+	// that header for ANY session holding audit:read - which the seeded VIEWER
+	// role holds. So through the portal a viewer passed every AdminAuthority
+	// gate: whole-tenant compliance exports, /api/v1/evidence/export,
+	// /api/v1/sebi/audit/export, budget-governance CRUD, execution
+	// cancel/delete, and unredacted spend on budgets/check.
+	//
+	// Two headers, because one header cannot carry two independent answers. A
+	// caller may present read scope without authority (viewer: tenant-wide
+	// reads, no administration).
+	//
+	// Authority WITHOUT read scope resolves to NEITHER, not to authority alone:
+	// read_scope.go reads this header only inside the branch that has already
+	// matched HeaderReadScope, so an authority assertion on its own is
+	// discarded. That is the coherent direction (AdminAuthority implies
+	// TenantWide) and it fails closed, but it is a silent drop - a caller that
+	// stamps only this header gets least-privilege with no diagnostic. The
+	// portal always stamps both, in that order.
+	HeaderAdminAuthority = "X-Axonflow-Admin-Authority"
+
+	// AdminAuthorityAsserted is the sole recognized HeaderAdminAuthority value.
+	AdminAuthorityAsserted = "true"
 )
 
+// NeverClientAssertableHeaders is the closed set of trusted-plane headers a
+// CLIENT may never assert, in any spelling, on any route.
+//
+// The orchestrator honours every one of these on a proxy-auth'd request, and
+// the agent's Director adds proxy-auth to everything it forwards, so an inbound
+// value that survived the hop would let any governed caller mint the authority
+// the header names.
+//
+// This exists as ONE list because the strip is performed at two separate sites
+// in platform/agent/proxy.go (the preflight branch and the authenticated
+// branch) and they had independently-maintained literal lists. Adding a header
+// here fail-closes both at once. Two tests pin it, one per site, because they
+// are separate code paths and a single test would report green while the other
+// leaked: TestEveryNeverClientAssertableHeaderIsStripped drives the
+// authenticated branch and ...IsStrippedOnPreflight drives the preflight one.
+//
+// Do not copy this list into a third place.
+var NeverClientAssertableHeaders = []string{
+	HeaderUserRole,
+	HeaderReadScope,
+	HeaderAdminAuthority,
+}
+
+// AdminAuthorityFromHeader reports whether a HeaderAdminAuthority value asserts
+// administrative authority.
+//
+// Trimmed and case-insensitive so a proxy that normalizes header casing or
+// appends whitespace cannot silently drop the assertion; anything other than
+// "true" is ignored, so "false", "1", "yes" and "" all mean no authority. The
+// permissive parse is safe in only this direction: it can never turn an absent
+// header into an assertion.
+func AdminAuthorityFromHeader(v string) bool {
+	return strings.EqualFold(strings.TrimSpace(v), AdminAuthorityAsserted)
+}
+
 // RoleCanReadTenant reports whether the resolved authz role grants tenant-wide
-// (cross-user) READ access on the fleet plane: admin and owner do; every other
-// role — including "" (least-privilege / unmapped) and any unknown string —
-// reads own-rows only. Fail-closed by construction: NormalizeRole collapses
-// unrecognized input to "" before the check, so no minting or forwarding path
-// can smuggle an unrecognized-but-privileged role string past this gate.
+// (cross-user) READ access on the fleet plane: admin, owner and policy_admin
+// do; every other role — including "" (least-privilege / unmapped) and any
+// unknown string — reads own-rows only. Fail-closed by construction:
+// NormalizeRole collapses unrecognized input to "" before the check, so no
+// minting or forwarding path can smuggle an unrecognized-but-privileged role
+// string past this gate.
+//
+// policy_admin joined the tenant-wide set in #2993: it is the "read-everything,
+// change-nothing-identity" tier (tenant-wide audit/decision visibility without
+// SSO/SCIM/user administration), so a per-user policy_admin token must see the
+// whole tenant trail. developer and viewer stay own-rows — that own-vs-tenant
+// split is the enforced distinction between them and policy_admin on the fleet
+// plane (portal-plane distinctions live in the seeded role permission sets).
 func RoleCanReadTenant(role string) bool {
+	switch NormalizeRole(role) {
+	case "admin", "owner", "policy_admin":
+		return true
+	default:
+		return false
+	}
+}
+
+// RoleIsAdministrative reports whether the resolved authz role carries
+// ORG-ADMINISTRATIVE authority: admin and owner do, every other role — including
+// "" (least-privilege / unmapped) and any unknown string — does not.
+//
+// #3001: this exists so the "owner is a strict superset of admin" guarantee
+// (#2993) cannot be broken again by a literal `role == "admin"` compare. Two
+// sites did exactly that, and both EXCLUDED owner, inverting the model — an
+// owner received strictly LESS than an admin. Any site that wants "an org
+// administrator" must ask here rather than string-compare, so adding a role to
+// the administrative tier is one edit.
+//
+// Deliberately NOT policy_admin: that tier administers POLICIES, not the org
+// (it is the read-everything, change-nothing-identity role). Widening it here
+// would hand it enforcement relaxations the five-role model does not grant it.
+//
+// Fail-closed by construction: NormalizeRole collapses unrecognized input to ""
+// before the check, so no minting or forwarding path can smuggle an
+// unrecognized-but-privileged role string past this gate.
+func RoleIsAdministrative(role string) bool {
 	switch NormalizeRole(role) {
 	case "admin", "owner":
 		return true

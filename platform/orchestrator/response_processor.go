@@ -292,7 +292,7 @@ func (p *ResponseProcessor) processWithSharedEngine(ctx context.Context, user Us
 	// load failure would leave evalCats empty and return the LLM response
 	// unredacted (fail-OPEN). Withhold the response instead — a redactor must
 	// never forward content it could not scan.
-	if err := p.sharedPolicyEngine.PoliciesLoadable(ctx, user.TenantID, nil, sharedpolicy.PhaseResponse); err != nil {
+	if err := p.sharedPolicyEngine.PoliciesLoadable(ctx, user.TenantID, sharedpolicy.OrgScopePtr(user.OrgID), sharedpolicy.PhaseResponse); err != nil {
 		log.Printf("[ResponseProcessor] Response withheld: could not load response-phase policies (fail-closed, #2820): %v", err)
 		return data, &RedactionInfo{
 			Verdict:         responseVerdictBlocked,
@@ -307,8 +307,8 @@ func (p *ResponseProcessor) processWithSharedEngine(ctx context.Context, user Us
 	// evaluated, so a credential-shaped LLM response was never warn/block-enforced.
 	// nil+nil = nothing enabled → skip; must NOT fall through to EvaluateResponse
 	// with empty Categories (that evaluates ALL policies — the whitelist footgun).
-	piiCats := p.sharedPolicyEngine.EnabledPIICategories(ctx, user.TenantID, nil, sharedpolicy.PhaseResponse)
-	sensCats := p.sharedPolicyEngine.EnabledSensitiveDataCategories(ctx, user.TenantID, nil, sharedpolicy.PhaseResponse)
+	piiCats := p.sharedPolicyEngine.EnabledPIICategories(ctx, user.TenantID, sharedpolicy.OrgScopePtr(user.OrgID), sharedpolicy.PhaseResponse)
+	sensCats := p.sharedPolicyEngine.EnabledSensitiveDataCategories(ctx, user.TenantID, sharedpolicy.OrgScopePtr(user.OrgID), sharedpolicy.PhaseResponse)
 	evalCats := append(append([]sharedpolicy.PolicyCategory{}, piiCats...), sensCats...)
 	if len(evalCats) == 0 {
 		log.Printf("[ResponseProcessor] No enabled PII/sensitive-data policies, skipping shared engine")
@@ -317,8 +317,10 @@ func (p *ResponseProcessor) processWithSharedEngine(ctx context.Context, user Us
 
 	result := p.sharedPolicyEngine.EvaluateResponse(ctx, data, sharedpolicy.EvalOptions{
 		// v9 Phase 8 #2384 PR-C1: OrgID propagation for RLS-aware audit writes.
+		// #3048 R3 HIGH-3: OrganizationID scopes the loader's tenant pass.
 		TenantID:        user.TenantID,
 		OrgID:           user.OrgID,
+		OrganizationID:  sharedpolicy.OrgScopePtr(user.OrgID),
 		UserID:          fmt.Sprintf("%d", user.ID),
 		Categories:      evalCats,
 		SkipCategories:  gwCfg.SkipCategories,
@@ -549,11 +551,38 @@ func (p *ResponseProcessor) applyRedactions(user UserContext, data interface{}, 
 	return redactedData, redactionInfo
 }
 
-// getAllowedPIITypes returns PII types the user is allowed to see
+// getAllowedPIITypes returns PII types the user is allowed to see.
+//
+// PERMISSION-DRIVEN ONLY (#3001). This used to end with
+//
+//	if user.Role == "admin" { return []string{"*"} }
+//
+// which made an admin-role caller receive LLM responses completely unredacted.
+// Two things were wrong with it:
+//
+//  1. It was a literal string compare on the role, so `owner` did NOT match.
+//     After #2993 made owner a strict superset of admin everywhere else, this
+//     one site INVERTED the relationship — an owner got LESS (redacted) than an
+//     admin (raw). Any role-literal here re-introduces that class of drift.
+//  2. Whether a role bypasses PII redaction on response content at all is a
+//     compliance decision, not something to inherit. On a regulated deployment
+//     "the admin sees raw customer PII" must be claimed deliberately.
+//
+// So allowance now derives ONLY from explicit permissions, and NO role — admin
+// or owner — is auto-granted view_full_pii. Seeing raw PII is an opt-in an
+// operator makes by putting the permission on a role. Behavior change,
+// documented in the CHANGELOG.
+//
+// NOTE ON TRUST: UserContext (including Permissions) arrives on the request, so
+// these permissions are only as trustworthy as the caller — exactly as the
+// role literal was. This change does not alter that trust model; it makes the
+// grant explicit and role-agnostic. Tightening the plane's identity trust is
+// separate work.
 func (p *ResponseProcessor) getAllowedPIITypes(user UserContext) []string {
 	allowed := []string{}
 
-	// Map permissions to PII types
+	// Map permissions to PII types. view_full_pii is the "see everything this
+	// map covers" grant; it is intentionally NOT part of any seeded system role.
 	permissionMap := map[string][]string{
 		"view_full_pii":  {"ssn", "credit_card", "bank_account", "email", "phone", "address"},
 		"view_basic_pii": {"email", "phone"},
@@ -565,11 +594,6 @@ func (p *ResponseProcessor) getAllowedPIITypes(user UserContext) []string {
 		if piiTypes, exists := permissionMap[permission]; exists {
 			allowed = append(allowed, piiTypes...)
 		}
-	}
-
-	// Admins can see everything
-	if user.Role == "admin" {
-		return []string{"*"}
 	}
 
 	return allowed
@@ -645,9 +669,12 @@ func (p *ResponseProcessor) redactSlice(s []interface{}, detectedPII map[string]
 
 // isAllowed checks if a PII type is allowed for the user
 func (p *ResponseProcessor) isAllowed(piiType string, allowedPII []string) bool {
-	if contains(allowedPII, "*") {
-		return true
-	}
+	// NOTE (#3001): there is deliberately no `contains(allowedPII, "*")`
+	// blanket-allow short-circuit here any more. getAllowedPIITypes used to
+	// return []string{"*"} for the admin role; removing that producer while
+	// leaving this consumer would mean the moment anything else feeds a
+	// permission list in here — a stored `admin` role literally holds
+	// Permissions: ["*"] — allow-all would silently come back.
 	return contains(allowedPII, piiType)
 }
 
@@ -851,3 +878,12 @@ func getDefaultValidationRules() []ValidationRule {
 		},
 	}
 }
+
+// NOTE (#3015): a local isElevatedRole helper used to live here, returning
+// role == "admin" || role == "owner". It is gone: shipping a fresh hardcoded
+// role-literal pair in the very file whose purpose is removing them is
+// self-defeating, and a second definition of "administrative role" is exactly
+// the drift this PR exists to close. The one definition is
+// platform/shared/identity.RoleIsAdministrative, which normalizes through the
+// closed role vocabulary (so an unrecognized string fails closed) and is the
+// single place to edit when the tier changes.

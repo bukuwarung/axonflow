@@ -218,6 +218,17 @@ func extractTextFromMessages(messages []chatCompletionMessage) string {
 //  7. Emit OTel span via RecordDecision
 //  8. Return OpenAI-compatible response
 func handleOpenAICompat(w http.ResponseWriter, r *http.Request) {
+	// #3092 defence in depth — see the identical guard on handleDecide. This
+	// route is registered `.Methods("POST", "OPTIONS")`; before the middleware
+	// fix an anonymous OPTIONS reached the io.ReadAll below and this handler
+	// read up to 10 MiB from an unauthenticated caller before finding anything
+	// to reject.
+	if r.Method != http.MethodPost {
+		w.Header().Set("Allow", http.MethodPost)
+		sendOpenAIError(w, "method not allowed", "invalid_request_error", "method_not_allowed", http.StatusMethodNotAllowed)
+		return
+	}
+
 	startTime := time.Now()
 
 	// Read the request body so we can both parse it and forward it.
@@ -339,8 +350,11 @@ func handleOpenAICompat(w http.ResponseWriter, r *http.Request) {
 		}
 	} else if sharedEngine != nil {
 		requestResult := sharedEngine.EvaluateRequest(ctx, queryText, sharedpolicy.EvalOptions{
-			TenantID:        user.TenantID,
-			OrgID:           user.OrgID,
+			TenantID: user.TenantID,
+			OrgID:    user.OrgID,
+			// #3048 R3 HIGH-3: scope the loader's tenant pass by the
+			// validated caller org (org_id may differ from tenant_id).
+			OrganizationID:  sharedpolicy.OrgScopePtr(user.OrgID),
 			ConnectorName:   "openai_compat",
 			UserID:          fmt.Sprintf("%d", user.ID),
 			Categories:      openaiCompatPolicyCategories,

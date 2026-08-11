@@ -17,8 +17,8 @@ import (
 
 // mockPolicyEngineForWCP implements the dynamic policy engine interface for testing
 type mockPolicyEngineForWCP struct {
-	result   *PolicyEvaluationResult
-	lastReq  OrchestratorRequest
+	result    *PolicyEvaluationResult
+	lastReq   OrchestratorRequest
 	callCount int
 }
 
@@ -35,6 +35,10 @@ func (m *mockPolicyEngineForWCP) EvaluateDynamicPolicies(ctx context.Context, re
 }
 
 func (m *mockPolicyEngineForWCP) ListActivePolicies() []DynamicPolicy {
+	return []DynamicPolicy{}
+}
+
+func (m *mockPolicyEngineForWCP) ListActivePoliciesForTenant(_ string) []DynamicPolicy {
 	return []DynamicPolicy{}
 }
 
@@ -244,10 +248,10 @@ func TestWCPPolicyAdapter_HumanReviewAction(t *testing.T) {
 
 // mockHITLApprovalCreator implements HITLApprovalCreator for testing
 type mockHITLApprovalCreator struct {
-	lastReq    *HITLApprovalRequest
-	resp       *HITLApprovalResponse
-	err        error
-	callCount  int
+	lastReq   *HITLApprovalRequest
+	resp      *HITLApprovalResponse
+	err       error
+	callCount int
 }
 
 func (m *mockHITLApprovalCreator) CreateApproval(ctx context.Context, req *HITLApprovalRequest) (*HITLApprovalResponse, error) {
@@ -576,7 +580,7 @@ func TestWCPPolicyAdapter_ToolContext_Propagation(t *testing.T) {
 			ToolName: "web_search",
 			ToolType: "function",
 			ToolInput: map[string]interface{}{
-				"query":      "AxonFlow governance",
+				"query":       "AxonFlow governance",
 				"max_results": 10,
 			},
 		},

@@ -14,6 +14,7 @@ import (
 	"github.com/google/uuid"
 
 	"axonflow/platform/agent/license"
+	"axonflow/platform/shared/tenantscope"
 )
 
 // Override repository errors
@@ -319,13 +320,41 @@ func (r *PolicyOverrideRepository) GetByID(ctx context.Context, id string) (*Pol
 	var createdBy, updatedBy sql.NullString
 	var orgIDCol sql.NullString
 
-	err := r.db.QueryRowContext(ctx, query, id).Scan(
-		&override.ID, &override.PolicyID, &override.PolicyType,
-		&override.OrganizationID, &override.TenantID, &orgIDCol,
-		&actionOverride, &enabledOverride,
-		&override.OverrideReason, &expiresAt,
-		&createdBy, &override.CreatedAt, &updatedBy, &override.UpdatedAt,
-	)
+	scan := func(row *sql.Row) error {
+		return row.Scan(
+			&override.ID, &override.PolicyID, &override.PolicyType,
+			&override.OrganizationID, &override.TenantID, &orgIDCol,
+			&actionOverride, &enabledOverride,
+			&override.OverrideReason, &expiresAt,
+			&createdBy, &override.CreatedAt, &updatedBy, &override.UpdatedAt,
+		)
+	}
+
+	// #3048: policy_overrides is RLS-enabled (mig 110, app.current_org_id) —
+	// the bare read matched 0 rows under axonflow_app_role and every by-id
+	// override access 404'd. Override rows are org-owned (never 'global'),
+	// so a single caller-org scope suffices.
+	//
+	// #3065 (F7): the unknown-caller-org case used to fall back to a BARE
+	// read. On a legacy owner-pool deployment (AXONFLOW_DB_USE_APP_ROLE unset
+	// — the docker-compose default and any non-flipped install) that read
+	// bypasses RLS entirely and resolves ANY org's override row. Its
+	// static-policy sibling has carried callerOrgOwnsStaticPolicy since #2384
+	// for exactly this reason; this one never got the guard. It matters
+	// because Delete() calls GetByID and then wraps its DELETE in
+	// WithOrgScope(existing.OrgID) — the VICTIM's org — so a bare by-id read
+	// is one wiring change away from a cross-tenant delete.
+	//
+	// An unknown caller org is now a denial before any SQL runs: there is no
+	// org to authorize against, and override rows are always org-owned (never
+	// the 'global' baseline), so there is no shared-row exemption to carve out.
+	callerOrg := OrgIDFromContext(ctx)
+	if callerOrg == "" {
+		return nil, ErrOverrideNotFound
+	}
+	err := WithOrgScope(ctx, r.db, callerOrg, func(tx *sql.Tx) error {
+		return scan(tx.QueryRowContext(ctx, query, id))
+	})
 	if err == sql.ErrNoRows {
 		return nil, ErrOverrideNotFound
 	}
@@ -334,6 +363,13 @@ func (r *PolicyOverrideRepository) GetByID(ctx context.Context, id string) (*Pol
 	}
 	if orgIDCol.Valid {
 		override.OrgID = orgIDCol.String
+	}
+
+	// The row-side half of the same invariant: a row that carries no org key
+	// is owned by nobody, and a row from another org is not the caller's even
+	// if a misconfigured pool surfaced it.
+	if tenantscope.NewOrgOnly(callerOrg).AuthorizeOrgOnly(override.OrgID) != nil {
+		return nil, ErrOverrideNotFound
 	}
 
 	if actionOverride.Valid {
@@ -381,9 +417,23 @@ func (r *PolicyOverrideRepository) GetEffectiveAction(
 	var enabledOverride sql.NullBool
 	var expiresAt sql.NullTime
 
-	err := r.db.QueryRowContext(ctx, query, policyID, tenantID).Scan(
-		&actionOverride, &enabledOverride, &expiresAt,
-	)
+	// #3048: org-scoped reads — bare, these matched 0 rows under
+	// axonflow_app_role and effective-action resolution silently ignored
+	// every live override. Scope key mirrors the write path (org header,
+	// falling back to the org_id==tenant_id identity).
+	scopeOrg := OrgIDFromContext(ctx)
+	if scopeOrg == "" && orgID != nil && *orgID != "" {
+		scopeOrg = *orgID
+	}
+	if scopeOrg == "" {
+		scopeOrg = tenantID
+	}
+
+	err := WithOrgScope(ctx, r.db, scopeOrg, func(tx *sql.Tx) error {
+		return tx.QueryRowContext(ctx, query, policyID, tenantID).Scan(
+			&actionOverride, &enabledOverride, &expiresAt,
+		)
+	})
 	if err == nil && actionOverride.Valid {
 		return OverrideAction(actionOverride.String), true, nil
 	}
@@ -403,9 +453,11 @@ func (r *PolicyOverrideRepository) GetEffectiveAction(
 			LIMIT 1
 		`
 
-		err = r.db.QueryRowContext(ctx, query, policyID, *orgID).Scan(
-			&actionOverride, &enabledOverride, &expiresAt,
-		)
+		err = WithOrgScope(ctx, r.db, scopeOrg, func(tx *sql.Tx) error {
+			return tx.QueryRowContext(ctx, query, policyID, *orgID).Scan(
+				&actionOverride, &enabledOverride, &expiresAt,
+			)
+		})
 		if err == nil && actionOverride.Valid {
 			return OverrideAction(actionOverride.String), true, nil
 		}

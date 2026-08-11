@@ -35,7 +35,7 @@ import (
 	"github.com/golang-jwt/jwt/v5"
 	"github.com/google/uuid"
 	"github.com/gorilla/mux"
-	_ "github.com/lib/pq" // PostgreSQL driver
+	"github.com/lib/pq" // PostgreSQL driver
 	"github.com/prometheus/client_golang/prometheus"
 	"github.com/prometheus/client_golang/prometheus/promhttp"
 	"github.com/rs/cors"
@@ -49,9 +49,11 @@ import (
 	"axonflow/platform/common/usage"
 	"axonflow/platform/orchestrator/cost"
 	"axonflow/platform/shared/idempotency"
+	sharedidentity "axonflow/platform/shared/identity"
 	logutil "axonflow/platform/shared/logger"
 	sharedpolicy "axonflow/platform/shared/policy"
 	"axonflow/platform/shared/secretenv"
+	"axonflow/platform/shared/serviceauth"
 )
 
 // AxonFlow Agent - Authentication, Authorization & Static Policy Enforcement Gateway
@@ -75,13 +77,47 @@ func envIntDefault(key string, def int) int {
 	return v
 }
 
-// isCommunityMode returns true if running in Community mode.
-// Community mode bypasses license validation and authentication for local development.
-// Pattern: DEPLOYMENT_MODE == "community" || DEPLOYMENT_MODE == "" (unset)
-// This is the canonical way to check for Community mode across the codebase.
+// isCommunityMode reports whether this process runs the Community posture.
+//
+// Community mode bypasses license validation AND authentication
+// (authenticator.go:158 returns a synthetic identity with no credential),
+// skips the MCP connector permission check (mcp_handler.go:92), auto-approves
+// require_approval policies (gateway_handlers.go:782) and lets a request body
+// assert its own tenant (decision_handler.go:717). It is the single most
+// permissive posture the agent has.
+//
+// #3096: it used to be the posture you got by FORGETTING to configure one.
+// `mode == ""` was in the true set, so a deployment that simply never set
+// DEPLOYMENT_MODE — the standalone docker-compose stacks, a bare `docker run`
+// of the published image (neither Dockerfile sets a default), `go run
+// ./platform/agent` — silently ran with authentication disabled. That is the
+// identical fail-open-on-unset shape #2287/#3068 fixed in the portal's
+// isAdminAuthRequired, whose default now denies.
+//
+// The burden of proof is now inverted: the permissive posture must be ASKED
+// for by name, and everything else — including the empty string — gets the
+// enterprise posture.
+//
+//	| DEPLOYMENT_MODE        | Community posture? |
+//	|------------------------|--------------------|
+//	| "community"            | YES                |
+//	| "" (unset)             | no  (was YES)      |
+//	| any other known mode   | no                 |
+//	| unrecognised / typo    | no                 |
+//
+// Deliberately NOT trimmed or case-folded, unlike isAdminAuthRequired. There,
+// normalising the input could only ever make auth MORE likely, because the
+// environment=="production" and adminAPIKey!="" rules dominate the switch.
+// Here every widening of the accepting set DISABLES authentication and there is
+// no dominating rule, so the set is exactly the canonical token. A value like
+// " community" therefore fails closed — and fails loudly, because the agent
+// then demands a license it was not given, which is the outcome you want from
+// a malformed mode string.
+//
+// Sibling: platform/orchestrator/run.go carries the same helper with the same
+// contract; the two are kept byte-identical in logic on purpose.
 func isCommunityMode() bool {
-	mode := os.Getenv("DEPLOYMENT_MODE")
-	return mode == "community" || mode == ""
+	return os.Getenv("DEPLOYMENT_MODE") == "community"
 }
 
 // isCommunitySaasMode returns true when running as the shared community SaaS server.
@@ -125,6 +161,48 @@ func getDeploymentKind() string {
 		return "dev"
 	}
 	return kind
+}
+
+// openMigrationDB opens the migration connection WITH a server-message handler.
+//
+// database/sql's plain Open discards every NOTICE and WARNING the server sends:
+// lib/pq only delivers them through pq.ConnectorWithNoticeHandler, and nothing
+// on this path installed one. Migrations tell their entire diagnostic story
+// through RAISE NOTICE / RAISE WARNING — how many owner assignments were
+// backfilled, which orgs were left without one and need the break-glass
+// endpoint, and the RLS canaries in core/149 and core/151 that report the
+// migration role cannot see `organizations` at all — and none of it has ever
+// reached the agent log. A migration that "warns" into a connection that throws
+// warnings away is not a signal; it is the silent failure it was written to
+// prevent, one layer down.
+//
+// Errors are NOT routed here: a failed migration comes back through Exec and
+// run.go log.Fatalf's on it. This is for the messages that accompany a
+// SUCCESSFUL apply, which are exactly the ones that were being lost.
+func openMigrationDB(dbURL string) (*sql.DB, error) {
+	base, err := pq.NewConnector(dbURL)
+	if err != nil {
+		return nil, err
+	}
+	return sql.OpenDB(pq.ConnectorWithNoticeHandler(base, func(n *pq.Error) {
+		if n == nil {
+			return
+		}
+		// WARNING is the only elevated severity that can arrive here: lib/pq
+		// dispatches this handler on NoticeResponse ('N') only, and an
+		// ErrorResponse ('E') goes to the error path instead — which is why the
+		// note above says errors are not routed here. Listing ERROR/FATAL/PANIC
+		// arms would be dead code contradicting that.
+		//
+		// Prefixed distinctly because a migration WARNING means the apply
+		// SUCCEEDED but did less than it claims, which is the case an operator
+		// must not scroll past.
+		if n.Severity == "WARNING" {
+			log.Printf("⚠️  [migration %s] %s", n.Severity, n.Message)
+			return
+		}
+		log.Printf("[migration %s] %s", n.Severity, n.Message)
+	})), nil
 }
 
 // setMigrationSessionVars seeds the Postgres session GUCs that downstream
@@ -645,13 +723,10 @@ func initServerImmediately(port string) {
 	globalRouter.NotFoundHandler = http.HandlerFunc(jsonNotFoundHandler)
 	globalRouter.MethodNotAllowedHandler = http.HandlerFunc(jsonMethodNotAllowedHandler)
 
-	// CORS middleware - configured once, used for all requests
-	globalCORS = cors.New(cors.Options{
-		AllowedOrigins:   []string{"*"}, // Configure for production
-		AllowedMethods:   []string{"GET", "POST", "PUT", "DELETE", "OPTIONS"},
-		AllowedHeaders:   []string{"*"},
-		AllowCredentials: true,
-	})
+	// CORS middleware - configured once, used for all requests.
+	// #3096: the origin policy is resolved from configuration rather than
+	// hardcoded to `"*"` + AllowCredentials. See resolveCORSOptions (cors.go).
+	globalCORS = cors.New(resolveCORSOptions())
 
 	// Register health check immediately - responds even during initialization
 	globalRouter.HandleFunc("/health", readinessAwareHealthHandler).Methods("GET")
@@ -752,6 +827,16 @@ func Run() {
 	// during initialization. Other routes are added after initialization completes.
 	// The server NEVER shuts down - eliminating transition gaps.
 	port := getEnv("PORT", "8080")
+
+	// #3068: mint the internal-service signing key BEFORE the server starts
+	// accepting requests. /api/request → forwardToOrchestrator is registered
+	// long before NewReverseProxyHandler used to initialize this, so any
+	// request landing in that window would reach the orchestrator without a
+	// proxy-auth token and now be refused. Doing it here also means the
+	// package-level generator is written once, before any request goroutine
+	// exists, so there is no concurrent read/write on it.
+	InitProxyTokenGenerator()
+
 	initServerImmediately(port)
 
 	// License validation (optional for central agent deployments and community mode)
@@ -894,9 +979,16 @@ func Run() {
 
 		// Multi-path migration collection (ADR-012)
 		// Collects migrations from core/, enterprise/, industry/* based on DEPLOYMENT_MODE
+		//
+		// A collection failure is FATAL, not a warning. It used to
+		// "continue anyway", which then fell through to the len==0 arm
+		// and booted with an unmigrated database. Since #3167 the
+		// realistic failure is an unrecognised DEPLOYMENT_MODE: the
+		// selector refuses to guess a schema rather than applying the
+		// widest set, and this is the refusal.
 		migrations, err := collectMigrations(migrationsPath)
 		if err != nil {
-			log.Printf("⚠️  Failed to collect migration files: %v (continuing anyway)", err)
+			log.Fatalf("❌ Cannot determine which database migrations to apply: %v", err)
 		} else if len(migrations) == 0 {
 			log.Println("ℹ️  No migration files found")
 		} else {
@@ -913,7 +1005,7 @@ func Run() {
 			var err error
 
 			for attempt := 1; attempt <= maxRetries; attempt++ {
-				migrationDB, err = sql.Open("postgres", dbURL)
+				migrationDB, err = openMigrationDB(dbURL)
 				if err == nil {
 					// Test connection with ping
 					err = migrationDB.Ping()
@@ -1125,7 +1217,12 @@ func Run() {
 			// SoX issue. Route through admin DB if available.
 			RequirePlatformAdminOrFatal("Marketplace")
 			meteringDB := authDB
-			if adminDB, adminErr := OpenPlatformAdminConnection(context.Background(), 3); adminErr != nil {
+			adminDB, adminErr := OpenPlatformAdminConnection(context.Background(), 3)
+			// #3159: the guard above only checks the DSN string is set. A DSN
+			// that yields no pool used to land in the WARNING branch below and
+			// meter on the RLS-blind pool — 0 nodes, undercharge.
+			RequirePlatformAdminPoolOrFatal("Marketplace", adminDB, adminErr)
+			if adminErr != nil {
 				log.Printf("[Marketplace] failed to open admin connection (%v); falling back to authDB", adminErr)
 			} else if adminDB != nil {
 				log.Println("[Marketplace] using axonflow_platform_admin (BYPASSRLS) connection for cross-org node-count metering")
@@ -1235,7 +1332,11 @@ func Run() {
 				RequirePlatformAdminOrFatal("NodeMonitor")
 				alerter := node_enforcement.NewMultiChannelAlerter()
 				monitorDB := usageDB
-				if adminDB, adminErr := OpenPlatformAdminConnection(ctx, 3); adminErr != nil {
+				adminDB, adminErr := OpenPlatformAdminConnection(ctx, 3)
+				// #3159: a configured-but-unusable admin DSN previously fell
+				// through to usageDB, where the cross-org node count reads 0.
+				RequirePlatformAdminPoolOrFatal("NodeMonitor", adminDB, adminErr)
+				if adminErr != nil {
 					log.Printf("[NodeMonitor] failed to open admin connection (%v); falling back to usageDB", adminErr)
 				} else if adminDB != nil {
 					log.Println("[NodeMonitor] using axonflow_platform_admin (BYPASSRLS) connection for cross-org node counts")
@@ -1326,7 +1427,11 @@ func Run() {
 		// agent process lifetime; the conn closes on process exit.
 		RequirePlatformAdminOrFatal("CSAAS-SWEEP")
 		sweepDB := authDB
-		if adminDB, adminErr := OpenPlatformAdminConnection(context.Background(), 3); adminErr != nil {
+		adminDB, adminErr := OpenPlatformAdminConnection(context.Background(), 3)
+		// #3159: a configured-but-unusable admin DSN previously fell through
+		// to authDB, where the cross-org sweep observes no rows at all.
+		RequirePlatformAdminPoolOrFatal("CSAAS-SWEEP", adminDB, adminErr)
+		if adminErr != nil {
 			log.Printf("[CSAAS-SWEEP] failed to open admin connection (%v); falling back to authDB", adminErr)
 		} else if adminDB != nil {
 			log.Printf("[CSAAS-SWEEP] using axonflow_platform_admin (BYPASSRLS) connection for cross-org sweep")
@@ -1363,7 +1468,16 @@ func Run() {
 	RegisterMCPServerHandler(globalRouter)
 
 	// Register connector refresh API endpoints (ADR-007)
-	// These endpoints allow manual cache invalidation for connector configurations
+	// These endpoints allow manual cache invalidation for connector configurations.
+	// #3067 (S-6): RegisterConnectorRefreshHandlers now wraps every route in
+	// apiAuthMiddleware and binds the tenancy to the authenticated credential,
+	// so registering here — ahead of the reverse proxy — no longer leaves an
+	// anonymous cache-eviction lever exposed. #2883 is the missing-authentication
+	// defect this PR closes, NOT a route-ordering ticket. The registration ORDER
+	// relative to the proxy prefix is a separate AVAILABILITY concern tracked as
+	// #3102: these exact paths win only because gorilla/mux matches in registration
+	// order, and a re-order would 404/405 them via the orchestrator rather than
+	// making them anonymous — the gate is applied inside the register function.
 	if tenantConnectorEnabled {
 		RegisterConnectorRefreshHandlers(globalRouter)
 	}
@@ -1413,6 +1527,11 @@ func Run() {
 	// with a louder warning). Lookup/Store run on usageDB (axonflow_app_role)
 	// under FORCE RLS wrapped in WithOrgAndTenantScope.
 	idempAdminDB, idempAdminErr := OpenPlatformAdminConnection(context.Background(), 3)
+	// #3159: an unset DSN keeps the documented nil-tolerant fallback (this site
+	// never required the pool). A DSN that IS configured and yields nothing is
+	// a misconfiguration, not a posture — the sweep silently stops and
+	// idempotency_keys grows unbounded.
+	RequirePlatformAdminPoolOrFatal("Idempotency", idempAdminDB, idempAdminErr)
 	if idempAdminErr != nil {
 		log.Printf("[Idempotency] WARN admin pool unavailable, sweep DISABLED — idempotency_keys table will grow unbounded under USE_APP_ROLE=true: %v", idempAdminErr)
 		idempAdminDB = nil
@@ -1452,6 +1571,11 @@ func Run() {
 	// FORCE RLS (the legacy ExpireStaleRequests path silently matches zero
 	// rows for axonflow_app_role with no GUC set — same bug class as #2400).
 	hitlExpireAdminDB, hitlExpireErr := OpenPlatformAdminConnection(context.Background(), 3)
+	// #3159: same split. Unset DSN → documented fallback; configured but
+	// unusable → stale-request expiration stops AND the #3048 by-request-id
+	// reads below lose their BYPASSRLS handle, so approve/reject dies on
+	// "approval request not found".
+	RequirePlatformAdminPoolOrFatal("HITL", hitlExpireAdminDB, hitlExpireErr)
 	if hitlExpireErr != nil {
 		log.Printf("[HITL] WARN expire-ticker admin pool unavailable — stale-request expiration DISABLED: %v", hitlExpireErr)
 		hitlExpireAdminDB = nil
@@ -1462,6 +1586,16 @@ func Run() {
 	// Register HITL (Human-in-the-Loop) API endpoints (EU AI Act Article 14)
 	// Enterprise feature: Human oversight queue for high-risk AI decisions
 	hitlRepo := hitl.NewRepository(usageDB)
+	// #3048: the repo's by-request-id discovery reads (GetByRequestID /
+	// GetHistory) and the deployment queue view (List) read ZERO rows through
+	// mig 025's RLS on the app-role pool — approve/reject/override flows died
+	// on "approval request not found". Route them through the BYPASSRLS admin
+	// pool already opened for the expire ticker above; when it is
+	// unavailable the repo falls back to the main pool (owner-pool
+	// deployments are unaffected, app-role deployments log the WARN above).
+	if hitlExpireAdminDB != nil {
+		hitlRepo.SetCrossOrgDB(hitlExpireAdminDB)
+	}
 	// Read pending approval limit from license tier
 	hitlLimits := license.GetCurrentLimits(context.Background())
 	hitlService := hitl.NewService(hitlRepo, hitl.ServiceConfig{
@@ -1636,7 +1770,13 @@ func Run() {
 		// Use admin connection if configured; fall back to usageDB.
 		RequirePlatformAdminOrFatal("CSAAS-RECOVERY")
 		recoveryDB := usageDB
-		if adminDB, adminErr := OpenPlatformAdminConnection(context.Background(), 3); adminErr != nil {
+		adminDB, adminErr := OpenPlatformAdminConnection(context.Background(), 3)
+		// #3159: recovery is itself a PRE-AUTH lookup — a configured-but-unusable
+		// admin DSN previously fell through to usageDB, where every magic-link
+		// token and registration read returns nothing and the operator sees an
+		// authentication failure for a credential that was never wrong.
+		RequirePlatformAdminPoolOrFatal("CSAAS-RECOVERY", adminDB, adminErr)
+		if adminErr != nil {
 			log.Printf("[CSAAS-RECOVERY] failed to open admin connection (%v); falling back to usageDB", adminErr)
 		} else if adminDB != nil {
 			log.Println("[CSAAS-RECOVERY] using axonflow_platform_admin (BYPASSRLS) connection for pre-auth recovery lookups")
@@ -1666,11 +1806,20 @@ func Run() {
 		// CSAAS-RECOVERY above; same session-less email-validated lifecycle.
 		RequirePlatformAdminOrFatal("CSAAS-DELETE")
 		deleteDB := usageDB
-		if adminDB, adminErr := OpenPlatformAdminConnection(context.Background(), 3); adminErr != nil {
-			log.Printf("[CSAAS-DELETE] failed to open admin connection (%v); falling back to usageDB", adminErr)
-		} else if adminDB != nil {
+		// Distinct names from the CSAAS-RECOVERY pair above: both live in this
+		// same block scope, so a second `adminDB, adminErr :=` here is a
+		// compile error ("no new variables on left side of :="), not a silent
+		// rebind. Naming them separately is what keeps the two pools legible.
+		deleteAdminDB, deleteAdminErr := OpenPlatformAdminConnection(context.Background(), 3)
+		// #3159: a configured-but-unusable admin DSN previously fell through to
+		// usageDB, where delete-confirm issues an incomplete cascade under a
+		// receipt asserting the erasure completed.
+		RequirePlatformAdminPoolOrFatal("CSAAS-DELETE", deleteAdminDB, deleteAdminErr)
+		if deleteAdminErr != nil {
+			log.Printf("[CSAAS-DELETE] failed to open admin connection (%v); falling back to usageDB", deleteAdminErr)
+		} else if deleteAdminDB != nil {
 			log.Println("[CSAAS-DELETE] using axonflow_platform_admin (BYPASSRLS) connection for GDPR cascade DELETEs")
-			deleteDB = adminDB
+			deleteDB = deleteAdminDB
 		} else {
 			log.Println("[CSAAS-DELETE] WARNING: AXONFLOW_DB_PLATFORM_ADMIN_URL not set; falling back to usageDB. Under FORCE RLS as app_role, delete-confirm will silently issue an incomplete cascade with a lying GDPR receipt and delete-request will issue no tokens.")
 		}
@@ -1941,12 +2090,18 @@ func clientRequestHandler(w http.ResponseWriter, r *http.Request) {
 	} else if sharedEngine != nil {
 		// Primary path: UnifiedPolicyEngine (same as Gateway handler)
 		skipCats := append([]sharedpolicy.PolicyCategory(nil), gatewayDetectionCfg.SkipCategories...)
-		if user.Role == "admin" {
+		// #3001: routed through the shared role predicate rather than a
+		// literal `== "admin"`. The literal excluded `owner`, so an owner —
+		// a strict SUPERSET of admin since #2993 — was enforced MORE
+		// strictly than an admin on admin-access queries. `user` here is the
+		// ResolveUser-validated identity, not a client-supplied field.
+		if sharedidentity.RoleIsAdministrative(user.Role) {
 			skipCats = append(skipCats, sharedpolicy.CategoryAdminAccess)
 		}
 		requestResult := sharedEngine.EvaluateRequest(r.Context(), req.Query, sharedpolicy.EvalOptions{
 			TenantID:        user.TenantID,
 			OrgID:           user.OrgID,
+			OrganizationID:  sharedpolicy.OrgScopePtr(user.OrgID), // #3048 R3 HIGH-3 (N2)
 			ConnectorName:   "proxy",
 			UserID:          fmt.Sprintf("%d", user.ID),
 			Categories:      proxyPolicyCategories,
@@ -1964,25 +2119,44 @@ func clientRequestHandler(w http.ResponseWriter, r *http.Request) {
 	// Phase 2: Tenant-specific policies (if not already blocked and tier engine available)
 	if !policyResult.Blocked && tierAwarePolicyEngine != nil {
 		ctx := r.Context()
-		tierResult, err := tierAwarePolicyEngine.EvaluatePolicy(ctx, user.TenantID, nil, req.Query)
-		if err != nil {
-			log.Printf("⚠️ Tier-aware policy evaluation error: %v", err)
-		} else if tierResult.Matched && tierResult.Action == "block" {
-			// Tenant policy triggered a block
-			policyResult.Blocked = true
-			policyResult.Reason = fmt.Sprintf("Blocked by %s policy: %s", tierResult.Tier, tierResult.PolicyName)
-			policyResult.TriggeredPolicies = append(policyResult.TriggeredPolicies, tierResult.PolicyID)
-			policyResult.Severity = tierResult.Severity
-			log.Printf("🛡️ Tenant policy blocked request: %s (tier: %s)", tierResult.PolicyName, tierResult.Tier)
-		} else if tierResult.Matched {
-			// Policy matched but action is not block (allow, warn, log, redact, require_approval)
-			policyResult.TriggeredPolicies = append(policyResult.TriggeredPolicies, tierResult.PolicyID)
-			log.Printf("📝 Tenant policy matched (action=%s): %s", tierResult.Action, tierResult.PolicyName)
 
-			// Issue #1081: Set RequiresApproval for HITL enforcement (Enterprise only)
-			if tierResult.Action == "require_approval" {
-				policyResult.RequiresApproval = true
-				log.Printf("⏸️ HITL required by tenant policy: %s", tierResult.PolicyName)
+		// #3051 (ADR-060 P3): resolve the caller's governance-segment set for
+		// POLICY-AFFECTING consumption — unlike resolveUserSegments
+		// (mcp_identity.go, P2, observability-only), a genuine resolution
+		// ERROR here must DENY the request, never silently fall back to
+		// org-only (ADR-060 §Fail-closed, locked). segOK=false means "deny";
+		// segOK=true with a nil/empty set means either the capability is
+		// unavailable (community mode / no SCIM configured — not a failure)
+		// or the caller legitimately belongs to zero segments.
+		segmentIDs, segOK := resolveSegmentsForPolicy(ctx, user.OrgID, user.Email, true)
+		if !segOK {
+			policyResult.Blocked = true
+			policyResult.Reason = "segment resolution unavailable — request denied (fail-closed, ADR-060 #2989)"
+			policyResult.TriggeredPolicies = append(policyResult.TriggeredPolicies, "segment_resolution_failed")
+			log.Printf("🛡️ Request denied: segment resolution failed (fail-closed) for org %s", logutil.Sanitize(user.OrgID))
+		}
+
+		if !policyResult.Blocked {
+			tierResult, err := tierAwarePolicyEngine.EvaluatePolicy(ctx, user.TenantID, nil, segmentIDs, req.Query)
+			if err != nil {
+				log.Printf("⚠️ Tier-aware policy evaluation error: %v", err)
+			} else if tierResult.Matched && tierResult.Action == "block" {
+				// Tenant/segment policy triggered a block
+				policyResult.Blocked = true
+				policyResult.Reason = fmt.Sprintf("Blocked by %s policy: %s", tierResult.Tier, tierResult.PolicyName)
+				policyResult.TriggeredPolicies = append(policyResult.TriggeredPolicies, tierResult.PolicyID)
+				policyResult.Severity = tierResult.Severity
+				log.Printf("🛡️ Tenant policy blocked request: %s (tier: %s)", tierResult.PolicyName, tierResult.Tier)
+			} else if tierResult.Matched {
+				// Policy matched but action is not block (allow, warn, log, redact, require_approval)
+				policyResult.TriggeredPolicies = append(policyResult.TriggeredPolicies, tierResult.PolicyID)
+				log.Printf("📝 Tenant policy matched (action=%s): %s", tierResult.Action, tierResult.PolicyName)
+
+				// Issue #1081: Set RequiresApproval for HITL enforcement (Enterprise only)
+				if tierResult.Action == "require_approval" {
+					policyResult.RequiresApproval = true
+					log.Printf("⏸️ HITL required by tenant policy: %s", tierResult.PolicyName)
+				}
 			}
 		}
 	}
@@ -2674,6 +2848,58 @@ func forwardToOrchestrator(req ClientRequest, user *User, client *Client) (inter
 		return nil, fmt.Errorf("failed to create orchestrator request: %v", err)
 	}
 	orchReq.Header.Set("Content-Type", "application/json")
+
+	// #3179: stamp the VALIDATED per-user identity onto this hop.
+	//
+	// validateUserToken has already resolved `user` from verified HS256 claims
+	// a few lines above. Until now this forward passed that identity only in the
+	// request BODY — a channel the orchestrator cannot distinguish from a
+	// client-chosen one, which is exactly what #3152 removed as a trust source.
+	// Without this the governed plane would be left with NO identity channel at
+	// all: audit_logs.user_email would go empty on POST /api/request, and a
+	// {user.role not_in <privileged>} policy would stop EXEMPTING a caller whose
+	// JWT says they are privileged.
+	//
+	// This is not a new forgeable channel. The request is constructed fresh at
+	// http.NewRequest above — nothing is copied from the inbound request — so
+	// these headers cannot carry a client-supplied value. The competing reverse-
+	// proxy path (proxy.go) Dels both headers unconditionally and re-Sets them
+	// only from a cryptographically validated per-user token.
+	//
+	// SAFE ON THE AUTHORIZATION AXIS, established rather than assumed: the role
+	// header is consumed for authorization only by read_scope.go:280
+	// (RoleCanReadTenant -> AdminAuthority), which runs inside
+	// resolveCallerReadScope — called only from the audit / decisions / explain
+	// read handlers. This forward targets exactly /api/v1/process, /api/v1/plan
+	// and /api/v1/plan/execute, none of which call it and none of which appear
+	// in gatedDomainRoutes or tenantWideAuditExportPaths. So the "admin" that
+	// community mode synthesises, and the "evaluator" community-SaaS mints,
+	// cannot become read authority here. They remain what they already were on
+	// this plane: a value policy conditions may match on.
+	//
+	// NB the JWT `role` claim is NOT vocabulary-normalised (getClaimString is
+	// verbatim, unlike the per-user-token path's identity.NormalizeRole). That
+	// is acceptable for policy matching and would NOT be acceptable for an
+	// authorization decision — which is the reason the paragraph above has to
+	// hold, not merely be likely.
+	if user != nil {
+		if user.Email != "" {
+			orchReq.Header.Set("X-User-Email", user.Email)
+		}
+		if user.Role != "" {
+			orchReq.Header.Set(sharedidentity.HeaderUserRole, user.Role)
+		}
+	}
+	// #3068: prove this hop came from the Agent. This is the MAIN governance
+	// forward (/api/v1/process, /api/v1/plan, /api/v1/plan/execute) and it is
+	// NOT the reverse proxy — proxy.go's Director never runs for it, so it was
+	// the one agent→orchestrator path that stamped no internal-service token.
+	// The orchestrator now requires one on every non-exempt route
+	// (requireInternalProxyAuth), so without this the governed request path
+	// itself would 403. Mirrors the MCP forwarders in mcp_server_handler.go.
+	if proxyTokenGenerator != nil {
+		orchReq.Header.Set("X-Axonflow-Proxy-Auth", serviceauth.GetInternalServiceToken(proxyTokenGenerator))
+	}
 	// Forward tenant/org/client context so orchestrator handlers can access them.
 	// X-Org-ID comes from the authenticated client's license (client.OrgID),
 	// matching the Single Entry Point proxy behavior in proxy.go. This enables
@@ -2780,15 +3006,27 @@ func policyTestHandler(w http.ResponseWriter, r *http.Request) {
 	if tenantID == "" {
 		tenantID = "community" // default for community mode
 	}
+	// #3255: the org this preview evaluates under comes from the
+	// AUTHENTICATED context, never from the tenant string. On the enterprise
+	// service-license path the two differ: TenantID is the Basic-Auth
+	// username the caller chooses (db_auth.go), while OrgID is validated from
+	// the license (auth.go). This value is passed to the segment resolver
+	// below, whose lookup is scoped by exactly this argument (SQL predicate
+	// and RLS GUC alike), so a tenant-sourced org let the caller choose whose
+	// directory the preview read - and the wrong org also silently matched
+	// nothing, making the preview under-report segment-scoped policies.
+	// The fallback preserves the previous behavior only where no authenticated
+	// org exists (the community shape, where tenant is not caller-influenced).
+	orgID := OrgIDFromContext(r.Context())
+	if orgID == "" {
+		orgID = tenantID
+	}
 	testUser := &User{
 		Email:       testReq.UserEmail,
 		Role:        "agent",
 		Permissions: []string{"query"},
 		TenantID:    tenantID,
-		// v9 Phase 8 #2384 PR-C1: policyTestHandler is an internal /api/v1/policies/test
-		// admin path; OrgID==TenantID is the safe default consistent with the
-		// community / community-saas auth synthesisers above.
-		OrgID: tenantID,
+		OrgID:       orgID,
 	}
 
 	// Two-phase evaluation (same as proxy handler — uses shared engine as primary)
@@ -2800,12 +3038,16 @@ func policyTestHandler(w http.ResponseWriter, r *http.Request) {
 		result = &StaticPolicyResult{}
 	} else if sharedEngine != nil {
 		skipCats := append([]sharedpolicy.PolicyCategory(nil), gatewayDetectionCfg.SkipCategories...)
-		if testUser.Role == "admin" {
+		// #3001: same shared predicate as the real request plane above. This
+		// handler exists to SIMULATE enforcement, so a literal here would make
+		// the simulation disagree with what actually happens for an `owner`.
+		if sharedidentity.RoleIsAdministrative(testUser.Role) {
 			skipCats = append(skipCats, sharedpolicy.CategoryAdminAccess)
 		}
 		requestResult := sharedEngine.EvaluateRequest(r.Context(), testReq.Query, sharedpolicy.EvalOptions{
 			TenantID:        testUser.TenantID,
 			OrgID:           testUser.OrgID,
+			OrganizationID:  sharedpolicy.OrgScopePtr(testUser.OrgID), // #3048 R3 HIGH-3 (N2)
 			ConnectorName:   "proxy",
 			UserID:          fmt.Sprintf("%d", testUser.ID),
 			Categories:      proxyPolicyCategories,
@@ -2821,7 +3063,22 @@ func policyTestHandler(w http.ResponseWriter, r *http.Request) {
 	// Phase 2: Tier-aware policies (if not blocked and engine available)
 	if !result.Blocked && tierAwarePolicyEngine != nil {
 		ctx := r.Context()
-		tierResult, err := tierAwarePolicyEngine.EvaluatePolicy(ctx, testUser.TenantID, nil, testReq.Query)
+		// #3051 (ADR-060 P3): resolve segments for the caller-supplied
+		// testReq.UserEmail so this simulation matches what /api/request would
+		// actually do for that user. Unlike the real request plane, nothing is
+		// being granted or enforced against testReq.UserEmail here — this is a
+		// read-only preview, already gated by this endpoint's tenant-level auth
+		// — so there is no privilege-escalation risk in resolving segments for
+		// arbitrary caller-supplied input the way there would be on the
+		// enforcement path. Unlike that path's fail-closed contract, a genuine
+		// resolution ERROR here must NOT deny the test call (nothing real is
+		// being blocked): fall back to an org-only simulation and log the gap.
+		segmentIDs, segOK := resolveSegmentsForPolicy(ctx, testUser.OrgID, testReq.UserEmail, false)
+		if !segOK {
+			log.Printf("⚠️ Policy test: segment resolution failed for %q — simulating org-only (a real /api/request call would fail-closed here)", logutil.Sanitize(testReq.UserEmail))
+			segmentIDs = nil
+		}
+		tierResult, err := tierAwarePolicyEngine.EvaluatePolicy(ctx, testUser.TenantID, nil, segmentIDs, testReq.Query)
 		if err != nil {
 			log.Printf("⚠️ Tier-aware policy test error: %v", err)
 		} else if tierResult.Matched && tierResult.Action == "block" {

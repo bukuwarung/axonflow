@@ -1,7 +1,7 @@
 //go:build !enterprise
 
 // Copyright 2026 AxonFlow
-// SPDX-License-Identifier: Apache-2.0
+// SPDX-License-Identifier: BUSL-1.1
 //
 // Tests for Community + Evaluation WCP HITL wiring.
 // Issue #1082: Wire WCP require_approval action to HITL queue
@@ -102,9 +102,13 @@ func TestEvalWCPHITLAdapter_CreateApproval_Success(t *testing.T) {
 	}
 
 	// Expect count query returning 5 (under limit)
+	// #3048: the pending COUNT runs org-scoped.
+	mock.ExpectBegin()
+	mock.ExpectExec("SELECT set_config").WillReturnResult(sqlmock.NewResult(0, 0))
 	mock.ExpectQuery("SELECT COUNT").WillReturnRows(
 		sqlmock.NewRows([]string{"count"}).AddRow(5),
 	)
+	mock.ExpectCommit()
 	// v9 Phase 8 PR-C2 (#2384): INSERT now wrapped in rls.WithOrgScope using
 	// req.OrgID. BEGIN + set_config + INSERT + COMMIT.
 	mock.ExpectBegin()
@@ -161,11 +165,16 @@ func TestEvalWCPHITLAdapter_CreateApproval_PendingLimitExceeded(t *testing.T) {
 	}
 
 	// Return count at limit
+	// #3048: the pending COUNT runs org-scoped.
+	mock.ExpectBegin()
+	mock.ExpectExec("SELECT set_config").WillReturnResult(sqlmock.NewResult(0, 0))
 	mock.ExpectQuery("SELECT COUNT").WillReturnRows(
 		sqlmock.NewRows([]string{"count"}).AddRow(100),
 	)
+	mock.ExpectCommit()
 
 	req := &HITLApprovalRequest{
+		OrgID:    "test-tenant", // #3048: OrgID required before the scoped COUNT
 		TenantID: "test-tenant",
 		StepName: "step-1",
 		PolicyID: "pol-1",
@@ -201,7 +210,11 @@ func TestEvalWCPHITLAdapter_CreateApproval_CountQueryError(t *testing.T) {
 		maxPendingPerTenant: 100,
 	}
 
+	// #3048: the pending COUNT runs org-scoped.
+	mock.ExpectBegin()
+	mock.ExpectExec("SELECT set_config").WillReturnResult(sqlmock.NewResult(0, 0))
 	mock.ExpectQuery("SELECT COUNT").WillReturnError(err)
+	mock.ExpectRollback()
 
 	req := &HITLApprovalRequest{
 		TenantID: "test-tenant",
@@ -233,9 +246,13 @@ func TestEvalWCPHITLAdapter_CreateApproval_InsertError(t *testing.T) {
 	}
 
 	// Count OK
+	// #3048: the pending COUNT runs org-scoped.
+	mock.ExpectBegin()
+	mock.ExpectExec("SELECT set_config").WillReturnResult(sqlmock.NewResult(0, 0))
 	mock.ExpectQuery("SELECT COUNT").WillReturnRows(
 		sqlmock.NewRows([]string{"count"}).AddRow(0),
 	)
+	mock.ExpectCommit()
 	// Insert fails
 	mock.ExpectExec("INSERT INTO hitl_approval_queue").WillReturnError(err)
 

@@ -538,6 +538,20 @@ func init() {
 //   - circuit-breaker trips return HTTP 503 so the PEP adapter can apply its
 //     configured fail-open / fail-closed posture (ADR-056 §Components)
 func handleDecide(w http.ResponseWriter, r *http.Request) {
+	// #3092 defence in depth. This route is registered `.Methods("POST",
+	// "OPTIONS")` so a preflight does not 404, and apiAuthMiddleware now
+	// TERMINATES OPTIONS rather than forwarding it. Neither fact is this
+	// handler's to rely on: the decision engine is reachable only by an
+	// authenticated POST, so it refuses anything else itself. Without this,
+	// re-adding a method to the registration — or reintroducing the preflight
+	// passthrough — silently hands an anonymous caller a full policy
+	// evaluation plus an audit_logs row with empty tenancy.
+	if r.Method != http.MethodPost {
+		w.Header().Set("Allow", http.MethodPost)
+		writeJSONError(w, "method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+
 	startTime := time.Now()
 	ctx := r.Context()
 
@@ -593,20 +607,20 @@ func handleDecide(w http.ResponseWriter, r *http.Request) {
 
 	// #2860: Enterprise per-client version-distribution telemetry — record the
 	// validated client/version pair (e.g. mcp-proxy/0.3.0) for the decide
-	// plane. POST-only guard: this route is registered `.Methods("POST",
-	// "OPTIONS")` and apiAuthMiddleware forwards CORS preflights (OPTIONS)
-	// UNAUTHENTICATED straight to this handler (auth.go). Recording on OPTIONS
-	// would let an anonymous caller mint label series and exhaust the
-	// per-process series cap, permanently blinding the distribution — so an
-	// authenticated POST is the only request we count. Telemetry-only +
+	// plane. This used to carry its own POST-only guard, because
+	// apiAuthMiddleware forwarded CORS preflights UNAUTHENTICATED straight to
+	// this handler and recording on OPTIONS would let an anonymous caller mint
+	// label series and exhaust the per-process series cap, permanently
+	// blinding the distribution. #3092 moved that guard to the top of the
+	// handler where it protects the whole body rather than this one call, so
+	// an authenticated POST is again the only request that reaches here.
+	// Telemetry-only +
 	// fail-open by contract (community no-op): a missing/garbage header is
 	// dropped inside the recorder and can never influence the verdict below —
 	// a version-bearing caller whose POST is later DENIED by policy still
 	// lands in the distribution (denies are traffic too; this plane counts
 	// attempts, unlike the post-decode check-output plane).
-	if r.Method == http.MethodPost {
-		recordClientVersionTelemetry(PlaneDecision, clientHeader)
-	}
+	recordClientVersionTelemetry(PlaneDecision, clientHeader)
 
 	// Canonicalized request context (#2509) is computed after a successful decode
 	// (it needs req.Context); declared here so the early-deny audit closure can
@@ -895,6 +909,12 @@ func handleDecide(w http.ResponseWriter, r *http.Request) {
 	if indonesiaPIIResult.BlockRecommended {
 		log.Printf("🛑 [Decide] Request blocked by Indonesia PII detection: %s", indonesiaPIIResult.Reason)
 		traceID = recordDecideDecision(ctx, decisionID, client.OrgID, client.TenantID, stage, VerdictDeny, []string{"indonesia_pii_protection"}, time.Since(startTime).Milliseconds(), []string{indonesiaPIIResult.Reason}, traceID, reqContext, contextTruncated, decisionAudit)
+		// #3242: persist the UU PDP / OJK detection events (MASKED values only)
+		// keyed to this decision, so the OJK pii_redactions export evidences the
+		// refusal and an auditor can pivot to the audit_logs row by decision_id.
+		// Best-effort; the deny above is already held. No-op in a community build.
+		recordIndonesiaPIIEvents(ctx, client.OrgID, client.TenantID, decisionID, traceID,
+			PlaneDecision, indonesiaPIIActionBlocked, indonesiaPIIResult)
 		writeDecideResponse(w, http.StatusOK, DecideResponse{
 			Verdict:           VerdictDeny,
 			DecisionID:        decisionID,
@@ -915,6 +935,15 @@ func handleDecide(w http.ResponseWriter, r *http.Request) {
 	// slipped through unredacted on the allow path while SSN/Aadhaar redacted.
 	if indonesiaPIIResult.HasPII && gwDetectionCfg.Enabled && indonesiaPIIResult.CriticalPII && gwDetectionCfg.PIIAction == DetectionActionRedact {
 		indonesiaPIIRequiresRedaction = true
+	}
+	// #3242: record every non-blocking detection too. Under a warn/log posture
+	// /decide returns a plain allow and emits no redact obligation, so this event
+	// is the ONLY record that Indonesia PII was present and was not masked —
+	// which is precisely what a UU PDP auditor asks for. decisionID is stamped so
+	// the event joins to the decision row this request will write.
+	if indonesiaPIIResult.HasPII {
+		recordIndonesiaPIIEvents(ctx, client.OrgID, client.TenantID, decisionID, traceID,
+			PlaneDecision, indonesiaPIIActionForDecisionPlane(false, indonesiaPIIRequiresRedaction), indonesiaPIIResult)
 	}
 
 	// RBI India PII pre-check (Aadhaar / PAN / UPI / bank-account validators).

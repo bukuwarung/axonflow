@@ -436,12 +436,15 @@ func GetConnectorForTenant(ctx context.Context, tenantID, connectorName string) 
 		return nil, fmt.Errorf("MCP registry not initialized")
 	}
 
-	connector, err := mcpRegistry.Get(connectorName)
+	// #3067 (S-1): the static-registry fallback is tenant-scoped too. Before,
+	// a lookup that missed the per-tenant cache fell through to a flat
+	// deployment-wide map and could return another tenant's connector.
+	connector, err := mcpRegistry.Get(tenantID, connectorName)
 	if err != nil {
 		return nil, fmt.Errorf("connector '%s' not found: %w", connectorName, err)
 	}
 
-	log.Printf("[MCP] Retrieved connector '%s' from static registry (fallback)", logutil.Sanitize(connectorName))
+	log.Printf("[MCP] Retrieved connector '%s' from static registry (fallback, tenant: %s)", logutil.Sanitize(connectorName), logutil.Sanitize(tenantID))
 	return connector, nil
 }
 
@@ -554,11 +557,31 @@ func registerAmadeusConnector() error {
 
 // RegisterMCPHandlers adds MCP endpoints to the router
 func RegisterMCPHandlers(r *mux.Router) {
-	// List all connectors
-	r.HandleFunc("/mcp/connectors", mcpListConnectorsHandler).Methods("GET")
+	// Connector inventory + per-connector health.
+	//
+	// #3067 (S-5): these two were registered with NO auth middleware and
+	// served every tenant's connector name, type, version, capabilities,
+	// health and raw driver error strings (which routinely embed host/db/user)
+	// to any anonymous caller; the /health variant additionally opened a live
+	// connection using the victim's decrypted credentials. They are now behind
+	// apiAuthMiddleware and scoped to the authenticated tenant, which is the
+	// same gate /api/clients and /api/policies/test already use. Registering
+	// them here (rather than leaving them bare on globalRouter) also keeps
+	// them from shadowing the authenticated proxy prefix — the route-ordering
+	// class tracked separately as #2883.
+	//
+	// NOTE (R3 BLOCKER): these are registered for GET ONLY, deliberately.
+	// apiAuthMiddleware forwards CORS preflights (`OPTIONS`) to the next
+	// handler WITHOUT authenticating — so registering "OPTIONS" here would
+	// hand an anonymous caller the handler with no identity in context, which
+	// resolves to the deployment-shared scope and serves exactly the
+	// inventory + live health check this change is closing. These endpoints
+	// are server-to-server (SDK/plugin), not browser-XHR, so they need no
+	// preflight.
+	r.Handle("/mcp/connectors", apiAuthMiddleware(http.HandlerFunc(mcpListConnectorsHandler))).Methods("GET")
 
 	// Health check for specific connector
-	r.HandleFunc("/mcp/connectors/{name}/health", mcpConnectorHealthHandler).Methods("GET")
+	r.Handle("/mcp/connectors/{name}/health", apiAuthMiddleware(http.HandlerFunc(mcpConnectorHealthHandler))).Methods("GET")
 
 	// Execute query (MCP Resource pattern - read-only)
 	r.HandleFunc("/mcp/resources/query", mcpQueryHandler).Methods("POST")
@@ -586,11 +609,15 @@ func mcpListConnectorsHandler(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	// Tenant comes from the authenticated credential (apiAuthMiddleware), never
+	// from a caller-supplied header or path segment (#3067 S-5).
+	tenantID := TenantIDFromContext(r.Context())
+
 	ctx, cancel := context.WithTimeout(r.Context(), 5*time.Second)
 	defer cancel()
 
-	// Get health status for all connectors
-	healthStatuses := mcpRegistry.HealthCheck(ctx)
+	// Get health status for the connectors this tenant may reach
+	healthStatuses := mcpRegistry.HealthCheck(ctx, tenantID)
 
 	// Build response
 	connectors := make([]map[string]interface{}, 0)
@@ -602,7 +629,7 @@ func mcpListConnectorsHandler(w http.ResponseWriter, r *http.Request) {
 		}
 
 		// Get connector type from registry
-		if conn, err := mcpRegistry.Get(name); err == nil {
+		if conn, err := mcpRegistry.Get(tenantID, name); err == nil {
 			connector["type"] = conn.Type()
 			connector["version"] = conn.Version()
 			connector["capabilities"] = conn.Capabilities()
@@ -635,10 +662,15 @@ func mcpConnectorHealthHandler(w http.ResponseWriter, r *http.Request) {
 	vars := mux.Vars(r)
 	connectorName := vars["name"]
 
+	// #3067 (S-5): scope to the authenticated tenant. Naming another tenant's
+	// connector now yields the same 404 as a nonexistent one — no existence
+	// oracle, and no live connection opened with the victim's credentials.
+	tenantID := TenantIDFromContext(r.Context())
+
 	ctx, cancel := context.WithTimeout(r.Context(), 5*time.Second)
 	defer cancel()
 
-	status, err := mcpRegistry.HealthCheckSingle(ctx, connectorName)
+	status, err := mcpRegistry.HealthCheckSingle(ctx, tenantID, connectorName)
 	if err != nil {
 		sendErrorResponse(w, "Connector not found", http.StatusNotFound, nil)
 		return
@@ -777,14 +809,17 @@ func evaluateInputPolicies(
 			sharedpolicy.CategoryComplianceEUAIAct,
 			sharedpolicy.CategoryComplianceMASFEAT,
 		}
-		inputCats = append(inputCats, policyEngine.EnabledPIICategories(ctx, tenantID, nil, sharedpolicy.PhaseRequest)...)
+		inputCats = append(inputCats, policyEngine.EnabledPIICategories(ctx, tenantID, sharedpolicy.OrgScopePtr(orgID), sharedpolicy.PhaseRequest)...)
 		out.StaticResult = policyEngine.EvaluateRequest(ctx, statement, sharedpolicy.EvalOptions{
-			TenantID:      tenantID,
-			OrgID:         orgID,
-			ConnectorName: connectorName,
-			UserID:        userID,
-			Parameters:    parameters,
-			Categories:    inputCats,
+			TenantID: tenantID,
+			OrgID:    orgID,
+			// #3048 R3 HIGH-3: scope the loader's tenant pass by the
+			// validated caller org (org_id may differ from tenant_id).
+			OrganizationID: sharedpolicy.OrgScopePtr(orgID),
+			ConnectorName:  connectorName,
+			UserID:         userID,
+			Parameters:     parameters,
+			Categories:     inputCats,
 			// #2801: capability-scoped evaluation. Advisory planes pass the
 			// caller-sent tool identity (e.g.
 			// claude_code.mcp__atlassian__editJiraIssue); managed-connector
@@ -876,7 +911,7 @@ func redactInputStatement(ctx context.Context, tenantID, userID, connectorName, 
 	// with PII unredacted (fulfilling a /decide redact_pii obligation it did not
 	// actually discharge). Reporting evaluated=false makes the PEP fail CLOSED
 	// (the #2563 B1 contract: redaction_evaluated=false → do not forward).
-	if err := policyEngine.PoliciesLoadable(ctx, tenantID, nil, sharedpolicy.PhaseRequest); err != nil {
+	if err := policyEngine.PoliciesLoadable(ctx, tenantID, sharedpolicy.OrgScopePtr(OrgIDFromContext(ctx)), sharedpolicy.PhaseRequest); err != nil {
 		log.Printf("[MCP] redactInputStatement: could not load request-phase policies (fail-closed, #2820): %v", err)
 		return "", false, false
 	}
@@ -894,10 +929,12 @@ func redactInputStatement(ctx context.Context, tenantID, userID, connectorName, 
 	// when no PII policy is enabled — we MUST skip the EvaluateResponse call in
 	// that case, because passing an empty Categories evaluates ALL policies (the
 	// whitelist short-circuits).
-	piiCats := policyEngine.EnabledPIICategories(ctx, tenantID, nil, sharedpolicy.PhaseRequest)
+	piiCats := policyEngine.EnabledPIICategories(ctx, tenantID, sharedpolicy.OrgScopePtr(OrgIDFromContext(ctx)), sharedpolicy.PhaseRequest)
 	if len(piiCats) > 0 {
 		result := policyEngine.EvaluateResponse(ctx, []map[string]interface{}{{"statement": working}}, sharedpolicy.EvalOptions{
-			TenantID:        tenantID,
+			TenantID:       tenantID,
+			OrganizationID: sharedpolicy.OrgScopePtr(OrgIDFromContext(ctx)), // #3048 R3 HIGH-3
+
 			ConnectorName:   connectorName,
 			UserID:          userID,
 			Categories:      piiCats,
@@ -1067,6 +1104,38 @@ func maskJSONSafe(s string, masker func(string) (string, bool)) (string, bool) {
 	return out, true
 }
 
+// indonesiaPIIRemainsAfterMask reports whether Indonesia PII is STILL present in
+// the content that is about to be forwarded, after the redaction pass ran.
+//
+// It reconstructs the same concatenated text the detection pass used, so the
+// two are directly comparable: if the detector found something before and still
+// finds something after, at least one value was not masked. That is the case a
+// batch-level "did we mask anything" flag cannot see, because the detector reads
+// leaves joined together and the masker reads them one at a time -- a match
+// spanning a leaf boundary is visible to the first and invisible to the second.
+//
+// Returning TRUE downgrades the recorded action from "redacted" to "detected".
+// Fail-safe direction: an inconclusive answer must never inflate the claim.
+func indonesiaPIIRemainsAfterMask(rows []map[string]interface{}, message string) bool {
+	var text string
+	if rows != nil {
+		for _, row := range rows {
+			for _, v := range row {
+				if s, ok := v.(string); ok {
+					text += s + " "
+				}
+			}
+		}
+	} else {
+		text = message
+	}
+	if text == "" {
+		return false
+	}
+	res := checkIndonesiaResponsePII(text, false)
+	return res != nil && res.HasPII
+}
+
 // toolIdentity (#2801): same contract as evaluateInputPolicies — advisory
 // planes (check-output, mcp-server check_output) pass the caller-sent
 // connector_type; managed-connector planes (query/execute responses) pass ""
@@ -1148,7 +1217,7 @@ func evaluateOutputPolicies(
 	// Indonesia checksum masker (step 2) is NOT sufficient on its own — it cannot
 	// clear generic PII — so a load error must block, not fall through to it.
 	if policyEngine := sharedpolicy.GetGlobalEngine(); policyEngine != nil && detectionGate {
-		if err := policyEngine.PoliciesLoadable(ctx, tenantID, nil, sharedpolicy.PhaseResponse); err != nil {
+		if err := policyEngine.PoliciesLoadable(ctx, tenantID, sharedpolicy.OrgScopePtr(OrgIDFromContext(ctx)), sharedpolicy.PhaseResponse); err != nil {
 			log.Printf("[MCP] Response withheld: policy engine could not load response-phase policies (fail-closed, #2820): %v", err)
 			out.StaticResult = &sharedpolicy.ResponseResult{
 				Blocked:         true,
@@ -1204,8 +1273,23 @@ func evaluateOutputPolicies(
 					},
 				}
 				log.Printf("[MCP] Response blocked by Indonesia PII detection: %s", logutil.Sanitize(idResult.Reason))
+				// #3242: persist the UU PDP / OJK detection events (MASKED values
+				// only) so the OJK pii_redactions export evidences this RESPONSE-side
+				// refusal. This plane is the one an auditor is most likely to be
+				// missing: input-side NIK governance was already visible via the
+				// decision row, output-side governance was invisible everywhere.
+				// Best-effort; the block above is already held. No-op in community.
+				recordIndonesiaPIIEvents(ctx, OrgIDFromContext(ctx), tenantID, "", "",
+					PlaneMCP, indonesiaPIIActionBlocked, idResult)
 				return out
 			}
+			// anyMasked records whether the redact pass below ACTUALLY modified
+			// content. The persisted detection event's action is derived from it, so
+			// "redacted" is never claimed on the strength of the posture alone:
+			// idText is the concatenation of every string leaf, so a match spanning a
+			// leaf boundary is detectable there and yet absent from every individual
+			// leaf, leaving the content unmodified.
+			anyMasked := false
 			if idResult.HasPII && mcpDetectionCfg.PIIAction == DetectionActionRedact {
 				// Mask NIK/NPWP/etc ONLY under PII_ACTION=redact, then feed the masked
 				// content forward into the static pass below. Under warn/log the action
@@ -1226,14 +1310,38 @@ func evaluateOutputPolicies(
 					if anyRedacted {
 						out.RedactedRows = rows
 						out.IndonesiaRedactedTypes = indonesiaDetectedTypeNames(idResult)
+						anyMasked = true
 					}
 				} else if message != "" {
 					if masked, changed := maskJSONSafe(message, redactIndonesiaPIIInString); changed {
 						message = masked
 						out.RedactedMessage = masked
 						out.IndonesiaRedactedTypes = indonesiaDetectedTypeNames(idResult)
+						anyMasked = true
 					}
 				}
+			}
+			// #3242: record the non-blocking outcome. Under a warn/log posture the
+			// content is forwarded UNMODIFIED and this event is the only record that
+			// Indonesia PII left the deployment in a tool response, so the action
+			// must distinguish "we masked it" from "we saw it and did not".
+			//
+			// anyMasked alone is NOT sufficient to claim "redacted". It is a
+			// BATCH-level flag over N detections, and the two passes see different
+			// text: the detector runs over every string leaf CONCATENATED, the
+			// masker runs per leaf. A match that spans a leaf boundary is detected
+			// and NOT masked, so a batch where anything was masked would record
+			// "redacted" for a bank account that was forwarded in the clear.
+			//
+			// The content is therefore RE-SCANNED after masking. If the detector
+			// still finds Indonesia PII in what is about to be forwarded, at least
+			// one value survived and the honest action is "detected" -- the record
+			// that PII left the deployment unmasked, which is the one an auditor
+			// most needs.
+			if idResult.HasPII {
+				cleanAfterMask := anyMasked && !indonesiaPIIRemainsAfterMask(rows, message)
+				recordIndonesiaPIIEvents(ctx, OrgIDFromContext(ctx), tenantID, "", "",
+					PlaneMCP, indonesiaPIIActionForEnforcedPlane(false, cleanAfterMask), idResult)
 			}
 		}
 	}
@@ -1252,12 +1360,12 @@ func evaluateOutputPolicies(
 		// had silently omitted pii-indonesia). nil => no enabled PII policies =>
 		// skip the static PII pass; must NOT pass empty Categories, which would
 		// evaluate ALL policies (the whitelist short-circuits on empty).
-		piiCats := policyEngine.EnabledPIICategories(ctx, tenantID, nil, sharedpolicy.PhaseResponse)
+		piiCats := policyEngine.EnabledPIICategories(ctx, tenantID, sharedpolicy.OrgScopePtr(OrgIDFromContext(ctx)), sharedpolicy.PhaseResponse)
 		// #2705: also evaluate the sensitive-data (secrets) category so a credential-
 		// shaped connector RESPONSE is warn/block-enforced per the profile lever (the
 		// block is already honored below via out.StaticResult.Blocked). nil+nil => skip
 		// (must NOT pass empty Categories — the whitelist footgun evaluates ALL).
-		sensCats := policyEngine.EnabledSensitiveDataCategories(ctx, tenantID, nil, sharedpolicy.PhaseResponse)
+		sensCats := policyEngine.EnabledSensitiveDataCategories(ctx, tenantID, sharedpolicy.OrgScopePtr(OrgIDFromContext(ctx)), sharedpolicy.PhaseResponse)
 		// #2727: also evaluate the security-dangerous category (dangerous commands +
 		// indirect prompt-injection patterns, migrations 059/116) against the tool
 		// OUTPUT. These policies seeded phase='request', so a malicious instruction
@@ -1271,7 +1379,7 @@ func evaluateOutputPolicies(
 		// warn/block), and the outcome is audited through the existing
 		// out.StaticResult redacted/blocked path. nil => no enabled security-dangerous
 		// policy for this phase => skip (must NOT pass empty Categories, the footgun).
-		dangerCats := policyEngine.EnabledSecurityDangerousCategories(ctx, tenantID, nil, sharedpolicy.PhaseResponse)
+		dangerCats := policyEngine.EnabledSecurityDangerousCategories(ctx, tenantID, sharedpolicy.OrgScopePtr(OrgIDFromContext(ctx)), sharedpolicy.PhaseResponse)
 		outCats := append(append(append([]sharedpolicy.PolicyCategory{}, piiCats...), sensCats...), dangerCats...)
 		if responseContent != nil && len(outCats) > 0 {
 			// #2727: the security-dangerous (injection) category is REDACTED on the
@@ -1284,10 +1392,11 @@ func evaluateOutputPolicies(
 			actionOverrides := mcpDetectionCfg.BuildActionOverrides()
 			actionOverrides[sharedpolicy.CategorySecurityDangerous] = ResolveResponseInjectionAction(ctx, OrgIDFromContext(ctx)).ToPolicyAction()
 			out.StaticResult = policyEngine.EvaluateResponse(ctx, responseContent, sharedpolicy.EvalOptions{
-				TenantID:      tenantID,
-				ConnectorName: connectorName,
-				UserID:        userID,
-				Categories:    outCats,
+				TenantID:       tenantID,
+				OrganizationID: sharedpolicy.OrgScopePtr(OrgIDFromContext(ctx)), // #3048 R3 HIGH-3
+				ConnectorName:  connectorName,
+				UserID:         userID,
+				Categories:     outCats,
 				// #2801: capability scoping on the response plane. For the
 				// categories evaluated here it only affects a text-document
 				// tool's security-dangerous EXECUTION-class policies (the
@@ -3336,7 +3445,15 @@ func mcpHealthHandler(w http.ResponseWriter, r *http.Request) {
 	ctx, cancel := context.WithTimeout(r.Context(), 5*time.Second)
 	defer cancel()
 
-	healthStatuses := mcpRegistry.HealthCheck(ctx)
+	// #3067: /mcp/health is an unauthenticated liveness probe, so the live
+	// health checks it runs are limited to the deployment-shared (operator-
+	// configured) connectors. Previously it opened a connection to EVERY
+	// tenant's backend on every anonymous GET — cross-tenant credential use
+	// plus a free amplification lever. Per-tenant connector health is served
+	// by the authenticated /mcp/connectors endpoints. total_connectors keeps
+	// its deployment-wide meaning (an aggregate integer that was already
+	// public here) so operator dashboards do not silently change scale.
+	healthStatuses := mcpRegistry.HealthCheck(ctx, registry.SharedTenant)
 
 	healthyCount := 0
 	unhealthyCount := 0

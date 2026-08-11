@@ -1,6 +1,6 @@
 # Getting Started with AxonFlow
 
-**Last Updated: July 2026** | **Platform: v9.8.0** | **SDKs: Python / Go / TypeScript / Java v8.5.1 + Rust v0.8.1 (preview)**
+**Last Updated: July 2026** | **Platform: v9.14.0** | **SDKs: Python / Go / TypeScript / Java v9.0.0 + Rust v0.8.1 (preview)**
 
 **Get AxonFlow running locally in about 10 minutes.**
 
@@ -65,7 +65,7 @@ Deploy AxonFlow in one click from AWS Marketplace:
 
 2. **Launch CloudFormation Stack**
    - Click "Continue to Configuration"
-   - Select your AWS region (e.g., `us-east-1`, `eu-central-1`)
+   - Select your AWS region (e.g., `us-east-1`)
    - Click "Continue to Launch"
    - Choose "Launch CloudFormation"
 
@@ -177,12 +177,12 @@ Choose your language:
 
 **Go:**
 ```bash
-go get github.com/getaxonflow/axonflow-sdk-go/v8
+go get github.com/getaxonflow/axonflow-sdk-go/v9
 ```
 
 **Python:**
 ```bash
-pip install axonflow-sdk
+pip install axonflow
 ```
 
 **Java:**
@@ -190,7 +190,7 @@ pip install axonflow-sdk
 <dependency>
     <groupId>com.getaxonflow</groupId>
     <artifactId>axonflow-sdk</artifactId>
-    <version>8.5.1</version>
+    <version>9.0.0</version>
 </dependency>
 ```
 
@@ -206,7 +206,7 @@ cargo add axonflow-sdk-rust
 
 ### Step 3: Write Your First Agent (3 minutes)
 
-Choose your language below. The four stable SDKs (Go / Python / TypeScript / Java) are fully supported at v8.5.1. Rust is in preview at v0.8.1 — covers proxy, audit, basic MAP, basic MCP, OpenAI + Anthropic interceptors, `create_hitl_request`, Indonesia PII category, the v9 `X-Client-ID` outbound header, plus the Decision Mode PEP (`decide` → `fulfill_request` → forward with engine-only, fail-closed redaction).
+Choose your language below. The four stable SDKs (Go / Python / TypeScript / Java) are fully supported at v9.0.0. Rust is in preview at v0.8.1 — covers proxy, audit, basic MAP, basic MCP, OpenAI + Anthropic interceptors, `create_hitl_request`, Indonesia PII category, the v9 `X-Client-ID` outbound header, plus the Decision Mode PEP (`decide` → `fulfill_request` → forward with engine-only, fail-closed redaction).
 
 #### Go
 
@@ -221,7 +221,7 @@ import (
     "log"
     "os"
 
-    axonflow "github.com/getaxonflow/axonflow-sdk-go/v8"
+    axonflow "github.com/getaxonflow/axonflow-sdk-go/v9"
 )
 
 func main() {
@@ -249,7 +249,7 @@ func main() {
 
     // Print the AI response
     fmt.Printf("Customer Question: %s\n\n", query)
-    fmt.Printf("AI Response:\n%s\n", response.Result)
+    fmt.Printf("AI Response:\n%v\n", response.Data)
     fmt.Printf("\nResponse Time: %.2fs\n", response.Metadata.Duration.Seconds())
     fmt.Printf("Tokens Used: %d\n", response.Metadata.TokensUsed)
     fmt.Printf("Cost: $%.4f\n", response.Metadata.Cost)
@@ -282,7 +282,7 @@ response = client.proxy_llm_call(
 
 # Print the AI response
 print(f"Customer Question: {query}\n")
-print(f"AI Response:\n{response.result}")
+print(f"AI Response:\n{response.data}")
 print(f"\nResponse Time: {response.metadata.duration:.2f}s")
 print(f"Tokens Used: {response.metadata.tokens_used}")
 print(f"Cost: ${response.metadata.cost:.4f}")
@@ -313,7 +313,7 @@ const response = await client.proxyLLMCall({
 
 // Print the AI response
 console.log(`Customer Question: ${query}\n`);
-console.log(`AI Response:\n${response.result}`);
+console.log(`AI Response:\n${response.data}`);
 console.log(`\nResponse Time: ${response.metadata.duration.toFixed(2)}s`);
 console.log(`Tokens Used: ${response.metadata.tokensUsed}`);
 console.log(`Cost: $${response.metadata.cost.toFixed(4)}`);
@@ -847,5 +847,4 @@ You've built your first AI agent with AxonFlow! Here's what to explore next:
 
 ---
 
-*Last Updated: April 2026*
-*Platform Version: v5.0.0 | SDK Version:** v5.0.0*
+*Last Updated: July 2026 | Platform: v9.14.0 | SDKs: v9.0.0*

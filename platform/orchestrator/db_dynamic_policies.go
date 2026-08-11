@@ -30,8 +30,18 @@ import (
 )
 
 type DatabaseDynamicPolicyEngine struct {
-	db           *sql.DB
-	metricsDB    *sql.DB
+	db        *sql.DB
+	metricsDB *sql.DB
+	// refreshDB serves the cache-refresh SELECT and the boot-time policy
+	// COUNT — both deliberate ALL-tenants reads feeding the multi-tenant
+	// gate cache. dynamic_policies is RLS-enabled (mig 018, org_id =
+	// get_current_org_id()), so on an app-role deployment these reads MUST
+	// run on the BYPASSRLS axonflow_platform_admin pool: on the app-role
+	// pool with no org GUC they match 0 rows and the gate cache silently
+	// empties — tenant dynamic policies stop being enforced (#3039). Falls
+	// back to db (with a loud log) on deployments without the admin role,
+	// where db is the table owner and sees everything anyway.
+	refreshDB    *sql.DB
 	policies     map[string]interface{}
 	mu           sync.RWMutex
 	lastRefresh  time.Time
@@ -86,9 +96,51 @@ func NewDatabaseDynamicPolicyEngine() (*DatabaseDynamicPolicyEngine, error) {
 	log.Printf("[dynamic-policy-engine] ✅ metricsDB pool connected as current_user=%s (UseAppRoleEnabled=%v, %s=%v)",
 		metricsRole, agent.UseAppRoleEnabled(), agent.EnvAppRoleURL, os.Getenv(agent.EnvAppRoleURL) != "")
 
+	// Cross-org read pool for the gate cache (see refreshDB field comment).
+	// Same OpenAppRoleConnection-vs-admin split as NodeMonitor (run.go) and
+	// the idempotency sweep: prefer axonflow_platform_admin (BYPASSRLS).
+	//
+	// This is the POLICY ENFORCEMENT path: on an app-role deployment a
+	// silent fallback to the main pool means the gate cache loads empty and
+	// tenant dynamic policies stop being enforced. The refuse-to-boot guard
+	// (RequirePlatformAdminOrFatal) fires at the run.go boot path, not
+	// here — tests construct the engine directly under app-role fixtures
+	// without an admin DSN and must not os.Exit the suite.
+	refreshDB := db
+	// #3159 R3: NO RequirePlatformAdminPoolOrFatal here, deliberately — the
+	// comment directly above states the invariant and it still holds. This is a
+	// CONSTRUCTOR with 16 test call sites, and a log.Fatalf reached from one of
+	// them kills the whole orchestrator test binary with no test-level failure
+	// message. The refuse-to-boot guard belongs at the run.go boot path, where
+	// RequirePlatformAdminOrFatal already fires for the unset-DSN case.
+	//
+	// The residual gap is real and stated rather than papered over: a
+	// CONFIGURED-but-unusable admin DSN still degrades the gate cache to the
+	// main pool here, where under app-role it reads zero rows and tenant
+	// dynamic policies stop being enforced. Closing it needs the pool to be
+	// opened at the boot path and injected, not a fatal in a constructor.
+	adminDB, adminErr := agent.OpenPlatformAdminConnection(bootCtx, 3)
+	if adminErr != nil || adminDB == nil {
+		// Reachable only when the gate is off (guard above no-ops) or the
+		// configured admin DSN is broken. nil-with-nil-err = DSN unset.
+		log.Printf("[dynamic-policy-engine] ⚠️  platform-admin pool unavailable (err=%v, dsn_configured=%v) — gate-cache refresh falls back to the main pool; "+
+			"under AXONFLOW_DB_USE_APP_ROLE=true this reads 0 rows through RLS and tenant dynamic policies will NOT be enforced (#3039)",
+			adminErr, os.Getenv(agent.EnvPlatformAdminURL) != "")
+	} else {
+		adminDB.SetMaxOpenConns(3)
+		adminDB.SetMaxIdleConns(1)
+		refreshDB = adminDB
+		var refreshRole string
+		if err := adminDB.QueryRowContext(bootCtx, "SELECT current_user").Scan(&refreshRole); err == nil {
+			log.Printf("[dynamic-policy-engine] ✅ gate-cache refresh pool (BYPASSRLS cross-org reads) connected as current_user=%s (UseAppRoleEnabled=%v, %s=%v)",
+				refreshRole, agent.UseAppRoleEnabled(), agent.EnvPlatformAdminURL, os.Getenv(agent.EnvPlatformAdminURL) != "")
+		}
+	}
+
 	engine := &DatabaseDynamicPolicyEngine{
 		db:           db,
 		metricsDB:    metricsDB,
+		refreshDB:    refreshDB,
 		policies:     make(map[string]interface{}),
 		cacheTimeout: 30 * time.Second,
 		lastRefresh:  time.Now(), // Initialize to prevent zero-time issues
@@ -138,9 +190,11 @@ func (e *DatabaseDynamicPolicyEngine) seedDefaultData() error {
 		log.Printf("Warning: Failed to seed system media policies: %v", err)
 	}
 
-	// Insert sample policies if table is empty
+	// Insert sample policies if table is empty. Cross-org COUNT — must run
+	// on the refresh pool: on the app-role pool RLS filters every row and
+	// the count reads 0 on every boot, re-attempting the sample seed.
 	var count int
-	err := e.db.QueryRow("SELECT COUNT(*) FROM dynamic_policies").Scan(&count)
+	err := e.crossOrgDB().QueryRow("SELECT COUNT(*) FROM dynamic_policies").Scan(&count)
 	if err != nil {
 		return err
 	}
@@ -341,6 +395,17 @@ func (e *DatabaseDynamicPolicyEngine) insertSamplePolicies() error {
 	return nil
 }
 
+// crossOrgDB returns the pool for deliberate all-tenants reads (gate-cache
+// refresh, boot COUNT). Falls back to the main pool when refreshDB is unset —
+// tests construct the engine via struct literals without the admin pool, and
+// non-app-role deployments read everything through db anyway.
+func (e *DatabaseDynamicPolicyEngine) crossOrgDB() *sql.DB {
+	if e.refreshDB != nil {
+		return e.refreshDB
+	}
+	return e.db
+}
+
 func (e *DatabaseDynamicPolicyEngine) refreshPolicies() error {
 	// Plugin Batch 1 (ADR-044): also load risk_level + allow_override so
 	// the evaluator can populate AppliedPoliciesDetail for override
@@ -358,7 +423,11 @@ func (e *DatabaseDynamicPolicyEngine) refreshPolicies() error {
 		ORDER BY priority DESC, created_at DESC
 	`
 
-	rows, err := e.db.Query(query)
+	// ALL-tenants read feeding the multi-tenant gate cache — must run on the
+	// BYPASSRLS refresh pool (see refreshDB field comment / #3039). On the
+	// app-role pool this SELECT silently returns 0 rows and every dynamic
+	// policy stops being enforced at the gate.
+	rows, err := e.crossOrgDB().Query(query)
 	if err != nil {
 		return fmt.Errorf("failed to query policies: %w", err)
 	}
@@ -611,7 +680,7 @@ func (e *DatabaseDynamicPolicyEngine) EvaluateDynamicPolicies(ctx context.Contex
 		Allowed:          true,
 		AppliedPolicies:  []string{},
 		DatabaseAccessed: true, // Mark that we're using DB-backed policies
-		ProcessingTimeMs: 0, // Will be set at the end
+		ProcessingTimeMs: 0,    // Will be set at the end
 		RiskScore:        0.0,
 		RequiredActions:  []string{},
 	}
@@ -638,14 +707,10 @@ func (e *DatabaseDynamicPolicyEngine) EvaluateDynamicPolicies(ctx context.Contex
 			name = cacheKey
 		}
 
-		// Check if policy applies to this tenant
-		metadata, ok := policyMap["_metadata"].(map[string]interface{})
-		if ok {
-			policyTenant, _ := metadata["tenant_id"].(string)
-			// "global" and "default" (NULL tenant_id) apply to all tenants
-			if policyTenant != "global" && policyTenant != "default" && policyTenant != tenantID {
-				continue
-			}
+		// Check if policy applies to this tenant. Shared choke point with
+		// ListActivePoliciesForTenant — see dbCachedPolicyAppliesToTenant.
+		if !dbCachedPolicyAppliesToTenant(policyMap, tenantID) {
+			continue
 		}
 
 		// CRITICAL: Evaluate conditions BEFORE applying actions
@@ -1050,6 +1115,30 @@ func (e *DatabaseDynamicPolicyEngine) evaluateCondition(cond map[string]interfac
 
 // getFieldValue extracts the value of a field from the request.
 // Supports dotted notation like "user.role" or "client.tenant_id"
+//
+// # Provenance of the user.* fields (#3152) — read before adding one
+//
+// These cases resolve straight off req.User, so whatever fills req.User decides
+// what a policy condition is evaluated against. Until #3152 that was the request
+// BODY: /api/v1/process is registered on the agent's reverse proxy, which
+// validates the caller's credential, stamps the tenancy headers and forwards the
+// caller's body byte for byte — so `{user.role not_equals "admin"} → block`, the
+// shape shipped as a built-in HIPAA template and offered in the portal's policy
+// builder, was evadable by asserting "user":{"role":"admin"}. A grep for
+// `User.Role =` across the orchestrator and agent returned zero assignments:
+// nothing had ever set it from a credential, a header or a JWT claim.
+//
+// req.User is now bound by applyAuthoritativePrincipal (run.go) on every handler
+// that decodes one and evaluates policy: user.email from the trust-gated
+// X-User-Email header, user.role from X-Axonflow-User-Role (settable only from a
+// validated per-user token — the agent Del()s any inbound value), and user.id /
+// user.region zeroed because no authenticated source for them exists on this
+// plane. The binding lives at the HANDLER, not here, so the in-memory sibling
+// engine (dynamic_policy_engine.go getFieldValue) is covered by the same fix.
+//
+// Consequence for a new case: a `user.*` field is only as trustworthy as the
+// channel the handler binds it from. Adding one whose value still comes from the
+// body re-opens this issue.
 func (e *DatabaseDynamicPolicyEngine) getFieldValue(field string, req OrchestratorRequest) interface{} {
 	switch field {
 	// Top-level fields
@@ -1157,82 +1246,157 @@ func (e *DatabaseDynamicPolicyEngine) toFloat64(v interface{}) float64 {
 	}
 }
 
+// dbCachedPolicyAppliesToTenant decides whether one cached policy applies to
+// one tenant. It is the SINGLE choke point for that decision on this engine:
+// both EvaluateDynamicPolicies (enforcement) and ListActivePoliciesForTenant
+// (disclosure) call it, so list and enforce cannot diverge by construction —
+// not by two predicates that merely look alike.
+//
+// It is deliberately shape-aware, because the cache holds two shapes with
+// OPPOSITE semantics and collapsing them is exactly how a list-vs-enforce
+// divergence was reproduced on the first cut of this fix:
+//
+//   - _metadata PRESENT: tenant_id must be "global", "default" (the NULL
+//     tenant_id sentinel assigned in refreshPolicies) or an exact match.
+//     A present-but-EMPTY tenant_id therefore applies to NOBODY.
+//   - _metadata ABSENT: the policy applies to EVERYBODY (there is no tenant
+//     key to gate on). refreshPolicies always writes _metadata, so this shape
+//     is unreachable in production; it is preserved verbatim because the
+//     enforcement loop has always behaved this way.
+//
+// DynamicPolicy.TenantID cannot express that difference — it is "" for both
+// shapes — which is why the scoped list works over the raw cache entries and
+// not over the converted structs.
+func dbCachedPolicyAppliesToTenant(policyMap map[string]interface{}, tenantID string) bool {
+	metadata, ok := policyMap["_metadata"].(map[string]interface{})
+	if !ok {
+		// No metadata → no tenant key to gate on → applies to all tenants.
+		return true
+	}
+	policyTenant, _ := metadata["tenant_id"].(string)
+	// "global" and "default" (NULL tenant_id) apply to all tenants.
+	return policyTenant == "global" || policyTenant == "default" || policyTenant == tenantID
+}
+
+// cachedPolicyToDynamicPolicy converts one raw cache entry into the wire
+// struct. Shared by ListActivePolicies and ListActivePoliciesForTenant so the
+// two views can never drift in what they expose per policy.
+func cachedPolicyToDynamicPolicy(cacheKey string, policyMap map[string]interface{}) DynamicPolicy {
+	// The cache is keyed by policy_id (refreshPolicies uses policy_id as the
+	// map key to avoid cross-tenant name collisions), so the loop variable is
+	// the UUID, NOT a human-readable name. Default Name to the key only as a
+	// fallback; the real human name lives in policyMap["name"] and is set
+	// below. Without this, every matched-policy surfaced to callers (e.g. the
+	// MCP dynamic-policy evaluator's matched_policies → the decision feed the
+	// Risk Committee reads) showed the opaque UUID instead of the policy name.
+	dp := DynamicPolicy{
+		Name:     cacheKey,
+		Type:     "database",
+		Enabled:  true,
+		Priority: 0,
+	}
+
+	// Extract the human-readable name (refreshPolicies stores it under "name").
+	if n, ok := policyMap["name"].(string); ok && n != "" {
+		dp.Name = n
+	}
+
+	// Extract policy_id
+	if policyID, ok := policyMap["policy_id"].(string); ok {
+		dp.ID = policyID
+	}
+
+	// Extract metadata
+	if metadata, ok := policyMap["_metadata"].(map[string]interface{}); ok {
+		if priority, ok := metadata["priority"].(int); ok {
+			dp.Priority = priority
+		}
+		if tenantID, ok := metadata["tenant_id"].(string); ok {
+			dp.TenantID = tenantID
+		}
+	}
+
+	// Extract conditions from stored JSON
+	if conditionsRaw, ok := policyMap["conditions"].(json.RawMessage); ok {
+		var conditions []PolicyCondition
+		if err := json.Unmarshal(conditionsRaw, &conditions); err == nil {
+			dp.Conditions = conditions
+		}
+	}
+
+	// Extract actions from stored JSON
+	if actionsRaw, ok := policyMap["actions"].(json.RawMessage); ok {
+		var actions []PolicyAction
+		if err := json.Unmarshal(actionsRaw, &actions); err == nil {
+			dp.Actions = actions
+		}
+	}
+
+	// Extract type
+	if pType, ok := policyMap["type"].(string); ok {
+		dp.Type = pType
+	}
+
+	// Extract category
+	if cat, ok := policyMap["category"].(string); ok {
+		dp.Category = cat
+	}
+
+	return dp
+}
+
+// ListActivePolicies returns the raw, DEPLOYMENT-WIDE view of the in-memory
+// policy cache — every tenant's policies (the cache is loaded cross-tenant on
+// the BYPASSRLS admin pool because the evaluator enforces every tenant's
+// policies in one process). That is correct for enforcement, but this view
+// must NEVER be returned to an HTTP caller: HTTP consumers use
+// ListActivePoliciesForTenant. This method has no HTTP-reachable caller and
+// must not grow one.
 func (e *DatabaseDynamicPolicyEngine) ListActivePolicies() []DynamicPolicy {
 	e.mu.RLock()
 	defer e.mu.RUnlock()
 
 	var policies []DynamicPolicy
-
 	for cacheKey, policy := range e.policies {
 		policyMap, ok := policy.(map[string]interface{})
 		if !ok {
 			continue
 		}
-
-		// The cache is keyed by policy_id (refreshPolicies uses policy_id as the
-		// map key to avoid cross-tenant name collisions), so the loop variable is
-		// the UUID, NOT a human-readable name. Default Name to the key only as a
-		// fallback; the real human name lives in policyMap["name"] and is set
-		// below. Without this, every matched-policy surfaced to callers (e.g. the
-		// MCP dynamic-policy evaluator's matched_policies → the decision feed the
-		// Risk Committee reads) showed the opaque UUID instead of the policy name.
-		dp := DynamicPolicy{
-			Name:     cacheKey,
-			Type:     "database",
-			Enabled:  true,
-			Priority: 0,
-		}
-
-		// Extract the human-readable name (refreshPolicies stores it under "name").
-		if n, ok := policyMap["name"].(string); ok && n != "" {
-			dp.Name = n
-		}
-
-		// Extract policy_id
-		if policyID, ok := policyMap["policy_id"].(string); ok {
-			dp.ID = policyID
-		}
-
-		// Extract metadata
-		if metadata, ok := policyMap["_metadata"].(map[string]interface{}); ok {
-			if priority, ok := metadata["priority"].(int); ok {
-				dp.Priority = priority
-			}
-			if tenantID, ok := metadata["tenant_id"].(string); ok {
-				dp.TenantID = tenantID
-			}
-		}
-
-		// Extract conditions from stored JSON
-		if conditionsRaw, ok := policyMap["conditions"].(json.RawMessage); ok {
-			var conditions []PolicyCondition
-			if err := json.Unmarshal(conditionsRaw, &conditions); err == nil {
-				dp.Conditions = conditions
-			}
-		}
-
-		// Extract actions from stored JSON
-		if actionsRaw, ok := policyMap["actions"].(json.RawMessage); ok {
-			var actions []PolicyAction
-			if err := json.Unmarshal(actionsRaw, &actions); err == nil {
-				dp.Actions = actions
-			}
-		}
-
-		// Extract type
-		if pType, ok := policyMap["type"].(string); ok {
-			dp.Type = pType
-		}
-
-		// Extract category
-		if cat, ok := policyMap["category"].(string); ok {
-			dp.Category = cat
-		}
-
-		policies = append(policies, dp)
+		policies = append(policies, cachedPolicyToDynamicPolicy(cacheKey, policyMap))
 	}
-
 	return policies
+}
+
+// ListActivePoliciesForTenant returns the active policies visible to a single
+// tenant. It walks the RAW cache entries — not the converted structs — and
+// gates each one through dbCachedPolicyAppliesToTenant, the very function
+// EvaluateDynamicPolicies uses to decide enforcement. Same input, same
+// function, same answer: a policy is listed to a tenant if and only if it is
+// enforced for that tenant.
+//
+// Walking the raw entries is load-bearing. DynamicPolicy.TenantID is "" both
+// for a policy whose _metadata carries an empty tenant_id (enforced for
+// NOBODY) and for a policy with no _metadata at all (enforced for
+// EVERYBODY); filtering the converted structs collapses those opposite
+// meanings and leaks the first shape to every tenant.
+//
+// This is the ONLY list variant HTTP handlers may consume.
+func (e *DatabaseDynamicPolicyEngine) ListActivePoliciesForTenant(tenantID string) []DynamicPolicy {
+	e.mu.RLock()
+	defer e.mu.RUnlock()
+
+	scoped := make([]DynamicPolicy, 0, len(e.policies))
+	for cacheKey, policy := range e.policies {
+		policyMap, ok := policy.(map[string]interface{})
+		if !ok {
+			continue
+		}
+		if !dbCachedPolicyAppliesToTenant(policyMap, tenantID) {
+			continue
+		}
+		scoped = append(scoped, cachedPolicyToDynamicPolicy(cacheKey, policyMap))
+	}
+	return scoped
 }
 
 func (e *DatabaseDynamicPolicyEngine) IsHealthy() bool {
@@ -1285,6 +1449,9 @@ func (e *DatabaseDynamicPolicyEngine) Close() error {
 		default:
 			close(e.stopCh)
 		}
+	}
+	if e.refreshDB != nil && e.refreshDB != e.db {
+		_ = e.refreshDB.Close()
 	}
 	if e.db != nil {
 		_ = e.db.Close()

@@ -1,6 +1,6 @@
 # SDK Feature Coverage
 
-**Last Updated:** 2026-03-01
+**Last Updated:** 2026-05-21
 **Reference:** ADR-022 SDK Method Inclusion Criteria
 
 This document defines what features AxonFlow SDKs cover and explicitly exclude.
@@ -220,10 +220,10 @@ The four established SDKs should have identical method coverage. Rust is a previ
 
 | SDK | Current Version | Methods | Parity |
 |-----|---------|---------|--------|
-| Go | v8.5.1 | ~45 | ✅ |
-| Python | v8.5.1 | ~45 | ✅ |
-| TypeScript | v8.5.1 | ~46 | ✅ (+protect) |
-| Java | v8.5.1 | ~45 | ✅ |
+| Go | v9.0.0 | ~45 | ✅ |
+| Python | v9.0.0 | ~45 | ✅ |
+| TypeScript | v9.0.0 | ~46 | ✅ (+protect) |
+| Java | v9.0.0 | ~45 | ✅ |
 | Rust _(preview)_ | v0.8.1 | ~21 | 🟡 Baseline (auth + proxy + audit + basic MAP + basic MCP + OpenAI + Anthropic interceptors + `create_hitl_request` + Indonesia PII + `X-Client-ID` + Decision Mode PEP) |
 
 ### Infrastructure (v4.1.0)

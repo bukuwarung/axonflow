@@ -106,7 +106,7 @@ All policies are configurable. Teams typically start in observe-only mode and en
 
 **Community Quickstart Demo (Code + Terminal, 2.5 min):** Governed calls, PII block, Gateway Mode with LangChain/CrewAI, and MAP from YAML — [Watch on YouTube](https://youtu.be/BSqU1z0xxCo)
 
-**Runtime Control Demo (Portal + Workflow, 3 min):** Want the product/runtime view? See approvals, retry safety, execution state, and the audit viewer in action — [Watch on YouTube](https://youtu.be/6UatGpn7KwE)
+**Runtime Control Demo (Portal + Workflow, 2.5 min):** Want the product/runtime view? See approvals, retry safety, execution state, and the audit viewer in action — [Watch on YouTube](https://youtu.be/sRTv2uF0sxY)
 
 **Architecture deep dive (12 min):** How the control plane works, policy enforcement flow, and multi-agent planning — [Watch on YouTube](https://youtu.be/Q2CZ1qnquhg)
 
@@ -453,8 +453,8 @@ Set `AXONFLOW_TRY=1` in your environment and any SDK will auto-connect. Rate-lim
 ```bash
 pip install axonflow              # Python
 npm install @axonflow/sdk         # TypeScript
-go get github.com/getaxonflow/axonflow-sdk-go/v8  # Go
-cargo add axonflow-sdk-rust       # Rust (preview, v0.5.0)
+go get github.com/getaxonflow/axonflow-sdk-go/v9  # Go
+cargo add axonflow-sdk-rust       # Rust (preview, v0.8.1)
 ```
 
 ```xml
@@ -462,7 +462,7 @@ cargo add axonflow-sdk-rust       # Rust (preview, v0.5.0)
 <dependency>
     <groupId>com.getaxonflow</groupId>
     <artifactId>axonflow-sdk</artifactId>
-    <version>8.3.0</version>
+    <version>9.0.0</version>
 </dependency>
 ```
 
@@ -500,7 +500,7 @@ const response = await axonflow.proxyLLMCall({
 ### Go
 
 ```go
-import axonflow "github.com/getaxonflow/axonflow-sdk-go/v8"
+import axonflow "github.com/getaxonflow/axonflow-sdk-go/v9"
 
 client := axonflow.NewClient(axonflow.AxonFlowConfig{
     Endpoint:     "http://localhost:8080",
@@ -565,7 +565,7 @@ let response = client.proxy_llm_call(
 ).await?;
 ```
 
-The Rust SDK is at v0.5.0 preview on [crates.io](https://crates.io/crates/axonflow-sdk-rust). Repo: [axonflow-sdk-rust](https://github.com/getaxonflow/axonflow-sdk-rust).
+The Rust SDK is at v0.8.1 preview on [crates.io](https://crates.io/crates/axonflow-sdk-rust). Repo: [axonflow-sdk-rust](https://github.com/getaxonflow/axonflow-sdk-rust).
 
 > **[SDK Documentation](https://docs.getaxonflow.com/docs/sdk/overview/)**
 

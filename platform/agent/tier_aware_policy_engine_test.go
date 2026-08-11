@@ -17,6 +17,7 @@ import (
 	"time"
 
 	"github.com/DATA-DOG/go-sqlmock"
+	"github.com/lib/pq"
 )
 
 func TestNewTierAwarePolicyEngine(t *testing.T) {
@@ -78,6 +79,68 @@ func TestNewTierAwarePolicyEngine(t *testing.T) {
 	}
 }
 
+// effectiveCols is StaticPolicyRepository.GetEffective's PER-PASS column list
+// (#3048 — the two-pass scoped read carries no override join columns).
+// #3051 (P3): segment_id is now selected on every pass.
+func effectiveCols() []string {
+	return []string{
+		"id", "policy_id", "name", "category", "pattern", "severity",
+		"description", "action", "tier", "priority", "enabled",
+		"organization_id", "tenant_id", "org_id", "segment_id",
+		"tags", "metadata", "version",
+		"created_at", "updated_at", "created_by", "updated_by",
+	}
+}
+
+// emptyOverrideRows is the empty result of GetEffective's pass-A overrides
+// fetch.
+func emptyOverrideRows() *sqlmock.Rows {
+	return sqlmock.NewRows([]string{
+		"id", "policy_id", "action_override", "enabled_override", "expires_at", "override_reason",
+	})
+}
+
+// expectEffectiveTwoPass registers the #3048 GetEffective read shape: pass A
+// (caller org scope — tenant/org-tier rows + live overrides) then pass B
+// ('global' scope — system-tier rows), each inside a WithOrgScope
+// transaction.
+//
+// expectedSegments pins the segment array GetEffective actually binds to
+// `sp.segment_id = ANY($N::text[])` on BOTH passes (static_policy_repository.go
+// pq.Array(segArg), where a nil segmentIDs input is normalized to an empty
+// slice before binding — see that function's segArg comment). Asserting it
+// here (rather than leaving the query's args unconstrained) is what makes
+// TestPolicyTestHandler_SegmentScopedPolicy_Blocks an actual proof that the
+// resolver's segment IDs reach the SQL query: a caller that resolved
+// segments but discarded them before calling GetEffective (e.g. passed nil)
+// would still get the canned rows back under the old unconstrained
+// mock.ExpectQuery, silently passing. The tenantID/orgID positional args
+// ($1/$2) are left as sqlmock.AnyArg() — they are constant across a given
+// test's setup and not what this helper exists to pin.
+func expectEffectiveTwoPass(mock sqlmock.Sqlmock, scopeOrg string, tenantRows, overrideRows, globalRows *sqlmock.Rows, expectedSegments []string) {
+	segArg := expectedSegments
+	if segArg == nil {
+		segArg = []string{}
+	}
+	mock.ExpectBegin()
+	mock.ExpectExec(`SELECT set_config\('app.current_org_id', \$1, true\)`).
+		WithArgs(scopeOrg).
+		WillReturnResult(sqlmock.NewResult(0, 0))
+	mock.ExpectQuery(`SELECT.*FROM static_policies sp`).
+		WithArgs(sqlmock.AnyArg(), sqlmock.AnyArg(), pq.Array(segArg)).
+		WillReturnRows(tenantRows)
+	mock.ExpectQuery(`SELECT po\.id, po\.policy_id`).WillReturnRows(overrideRows)
+	mock.ExpectCommit()
+	mock.ExpectBegin()
+	mock.ExpectExec(`SELECT set_config\('app.current_org_id', \$1, true\)`).
+		WithArgs(GlobalOrgSentinel).
+		WillReturnResult(sqlmock.NewResult(0, 0))
+	mock.ExpectQuery(`SELECT.*FROM static_policies sp`).
+		WithArgs(pq.Array(segArg)).
+		WillReturnRows(globalRows)
+	mock.ExpectCommit()
+}
+
 func TestTierAwarePolicyEngine_GetEffectivePolicies(t *testing.T) {
 	db, mock, err := sqlmock.New()
 	if err != nil {
@@ -90,39 +153,26 @@ func TestTierAwarePolicyEngine_GetEffectivePolicies(t *testing.T) {
 
 	// Setup mock for GetEffective - this uses a single JOIN query
 	// Column order matches StaticPolicyRepository.GetEffective query
-	rows := sqlmock.NewRows([]string{
-		"id", "policy_id", "name", "category", "pattern", "severity",
-		"description", "action", "tier", "priority", "enabled",
-		"organization_id", "tenant_id", "org_id",
-		"tags", "metadata", "version",
-		"created_at", "updated_at", "created_by", "updated_by",
-		"override_id", "action_override", "enabled_override",
-		"expires_at", "override_reason",
-	}).
-		AddRow(
-			"uuid-1", "sys_sqli_union", "SQL Injection UNION", "security-sqli", `union\s+select`, "critical",
-			"Blocks UNION-based SQL injection", "block", "system", 100, true,
-			nil, "global", "",
-			"[]", "{}", 1,
-			testTime, testTime, "system", "system",
-			nil, nil, nil, nil, nil, // No override
-		).
-		AddRow(
-			"uuid-2", "pii_ssn", "PII SSN Detection", "pii-us", `\d{3}-\d{2}-\d{4}`, "high",
-			"Detects SSN patterns", "redact", "tenant", 50, true,
-			nil, tenantID, "",
-			"[]", "{}", 1,
-			testTime, testTime, "user", "user",
-			nil, nil, nil, nil, nil, // No override
-		)
-
-	mock.ExpectQuery(`SELECT.*FROM static_policies`).
-		WillReturnRows(rows)
+	tenantRows := sqlmock.NewRows(effectiveCols()).AddRow(
+		"uuid-2", "pii_ssn", "PII SSN Detection", "pii-us", `\d{3}-\d{2}-\d{4}`, "high",
+		"Detects SSN patterns", "redact", "tenant", 50, true,
+		nil, tenantID, "", nil,
+		"[]", "{}", 1,
+		testTime, testTime, "user", "user",
+	)
+	globalRows := sqlmock.NewRows(effectiveCols()).AddRow(
+		"uuid-1", "sys_sqli_union", "SQL Injection UNION", "security-sqli", `union\s+select`, "critical",
+		"Blocks UNION-based SQL injection", "block", "system", 100, true,
+		nil, "global", "", nil,
+		"[]", "{}", 1,
+		testTime, testTime, "system", "system",
+	)
+	expectEffectiveTwoPass(mock, tenantID, tenantRows, emptyOverrideRows(), globalRows, nil)
 
 	engine := NewTierAwarePolicyEngine(db, nil)
 
 	// First call - cache miss
-	policies, err := engine.GetEffectivePolicies(context.Background(), tenantID, nil)
+	policies, err := engine.GetEffectivePolicies(context.Background(), tenantID, nil, nil)
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
@@ -141,7 +191,7 @@ func TestTierAwarePolicyEngine_GetEffectivePolicies(t *testing.T) {
 	}
 
 	// Second call - should use cache (no new DB calls)
-	policies2, err := engine.GetEffectivePolicies(context.Background(), tenantID, nil)
+	policies2, err := engine.GetEffectivePolicies(context.Background(), tenantID, nil, nil)
 	if err != nil {
 		t.Fatalf("unexpected error on cache hit: %v", err)
 	}
@@ -161,34 +211,21 @@ func TestTierAwarePolicyEngine_EvaluatePolicy(t *testing.T) {
 	testTime := time.Date(2025, 1, 1, 0, 0, 0, 0, time.UTC)
 
 	// Setup mock - uses JOIN query, column order matches StaticPolicyRepository.GetEffective
-	rows := sqlmock.NewRows([]string{
-		"id", "policy_id", "name", "category", "pattern", "severity",
-		"description", "action", "tier", "priority", "enabled",
-		"organization_id", "tenant_id", "org_id",
-		"tags", "metadata", "version",
-		"created_at", "updated_at", "created_by", "updated_by",
-		"override_id", "action_override", "enabled_override",
-		"expires_at", "override_reason",
-	}).
-		AddRow(
-			"uuid-1", "sys_sqli_union", "SQL Injection UNION", "security-sqli", `(?i)union\s+select`, "critical",
-			"Blocks UNION-based SQL injection", "block", "system", 100, true,
-			nil, "global", "",
-			"[]", "{}", 1,
-			testTime, testTime, "system", "system",
-			nil, nil, nil, nil, nil,
-		).
-		AddRow(
-			"uuid-2", "pii_ssn", "PII SSN Detection", "pii-us", `\d{3}-\d{2}-\d{4}`, "high",
-			"Detects SSN patterns", "redact", "tenant", 50, true,
-			nil, tenantID, "",
-			"[]", "{}", 1,
-			testTime, testTime, "user", "user",
-			nil, nil, nil, nil, nil,
-		)
-
-	mock.ExpectQuery(`SELECT.*FROM static_policies`).
-		WillReturnRows(rows)
+	tenantRows := sqlmock.NewRows(effectiveCols()).AddRow(
+		"uuid-2", "pii_ssn", "PII SSN Detection", "pii-us", `\d{3}-\d{2}-\d{4}`, "high",
+		"Detects SSN patterns", "redact", "tenant", 50, true,
+		nil, tenantID, "", nil,
+		"[]", "{}", 1,
+		testTime, testTime, "user", "user",
+	)
+	globalRows := sqlmock.NewRows(effectiveCols()).AddRow(
+		"uuid-1", "sys_sqli_union", "SQL Injection UNION", "security-sqli", `(?i)union\s+select`, "critical",
+		"Blocks UNION-based SQL injection", "block", "system", 100, true,
+		nil, "global", "", nil,
+		"[]", "{}", 1,
+		testTime, testTime, "system", "system",
+	)
+	expectEffectiveTwoPass(mock, tenantID, tenantRows, emptyOverrideRows(), globalRows, nil)
 
 	engine := NewTierAwarePolicyEngine(db, nil)
 
@@ -222,7 +259,7 @@ func TestTierAwarePolicyEngine_EvaluatePolicy(t *testing.T) {
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			result, err := engine.EvaluatePolicy(context.Background(), tenantID, nil, tt.input)
+			result, err := engine.EvaluatePolicy(context.Background(), tenantID, nil, nil, tt.input)
 			if err != nil {
 				t.Fatalf("unexpected error: %v", err)
 			}
@@ -258,41 +295,28 @@ func TestTierAwarePolicyEngine_EvaluateAllPolicies(t *testing.T) {
 	testTime := time.Date(2025, 1, 1, 0, 0, 0, 0, time.UTC)
 
 	// Both patterns should match - correct column order with override columns
-	rows := sqlmock.NewRows([]string{
-		"id", "policy_id", "name", "category", "pattern", "severity",
-		"description", "action", "tier", "priority", "enabled",
-		"organization_id", "tenant_id", "org_id",
-		"tags", "metadata", "version",
-		"created_at", "updated_at", "created_by", "updated_by",
-		"override_id", "action_override", "enabled_override",
-		"expires_at", "override_reason",
-	}).
-		AddRow(
-			"uuid-1", "pii_ssn", "PII SSN Detection", "pii-us", `\d{3}-\d{2}-\d{4}`, "high",
-			"Detects SSN patterns", "block", "system", 100, true,
-			nil, "global", "",
-			"[]", "{}", 1,
-			testTime, testTime, "system", "system",
-			nil, nil, nil, nil, nil,
-		).
-		AddRow(
-			"uuid-2", "pii_phone", "Phone Number Detection", "pii-us", `\d{3}-\d{4}`, "medium",
-			"Detects phone numbers", "warn", "tenant", 50, true,
-			nil, tenantID, "",
-			"[]", "{}", 1,
-			testTime, testTime, "user", "user",
-			nil, nil, nil, nil, nil,
-		)
-
-	mock.ExpectQuery(`SELECT.*FROM static_policies`).
-		WillReturnRows(rows)
+	tenantRows := sqlmock.NewRows(effectiveCols()).AddRow(
+		"uuid-2", "pii_phone", "Phone Number Detection", "pii-us", `\d{3}-\d{4}`, "medium",
+		"Detects phone numbers", "warn", "tenant", 50, true,
+		nil, tenantID, "", nil,
+		"[]", "{}", 1,
+		testTime, testTime, "user", "user",
+	)
+	globalRows := sqlmock.NewRows(effectiveCols()).AddRow(
+		"uuid-1", "pii_ssn", "PII SSN Detection", "pii-us", `\d{3}-\d{2}-\d{4}`, "high",
+		"Detects SSN patterns", "block", "system", 100, true,
+		nil, "global", "", nil,
+		"[]", "{}", 1,
+		testTime, testTime, "system", "system",
+	)
+	expectEffectiveTwoPass(mock, tenantID, tenantRows, emptyOverrideRows(), globalRows, nil)
 
 	engine := NewTierAwarePolicyEngine(db, nil)
 
 	// Input matches both patterns
 	input := "SSN: 123-45-6789, Phone: 555-1234"
 
-	results, err := engine.EvaluateAllPolicies(context.Background(), tenantID, nil, input)
+	results, err := engine.EvaluateAllPolicies(context.Background(), tenantID, nil, nil, input)
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
@@ -325,31 +349,20 @@ func TestTierAwarePolicyEngine_InvalidateCache(t *testing.T) {
 	testTime := time.Date(2025, 1, 1, 0, 0, 0, 0, time.UTC)
 
 	// First call - correct column order with override columns
-	rows := sqlmock.NewRows([]string{
-		"id", "policy_id", "name", "category", "pattern", "severity",
-		"description", "action", "tier", "priority", "enabled",
-		"organization_id", "tenant_id", "org_id",
-		"tags", "metadata", "version",
-		"created_at", "updated_at", "created_by", "updated_by",
-		"override_id", "action_override", "enabled_override",
-		"expires_at", "override_reason",
-	}).
-		AddRow(
-			"uuid-1", "test_policy", "Test Policy", "security-sqli", `test`, "medium",
-			"Test", "block", "system", 100, true,
-			nil, "global", "",
-			"[]", "{}", 1,
-			testTime, testTime, "system", "system",
-			nil, nil, nil, nil, nil,
-		)
-
-	mock.ExpectQuery(`SELECT.*FROM static_policies`).
-		WillReturnRows(rows)
+	tenantRows := sqlmock.NewRows(effectiveCols())
+	globalRows := sqlmock.NewRows(effectiveCols()).AddRow(
+		"uuid-1", "test_policy", "Test Policy", "security-sqli", `test`, "medium",
+		"Test", "block", "system", 100, true,
+		nil, "global", "", nil,
+		"[]", "{}", 1,
+		testTime, testTime, "system", "system",
+	)
+	expectEffectiveTwoPass(mock, tenantID, tenantRows, emptyOverrideRows(), globalRows, nil)
 
 	engine := NewTierAwarePolicyEngine(db, nil)
 
 	// First call - cache miss
-	_, err = engine.GetEffectivePolicies(context.Background(), tenantID, nil)
+	_, err = engine.GetEffectivePolicies(context.Background(), tenantID, nil, nil)
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
@@ -474,19 +487,29 @@ func TestBuildCacheKey(t *testing.T) {
 	engine := NewTierAwarePolicyEngine(db, nil)
 
 	tests := []struct {
-		tenantID string
-		orgID    *string
-		expected string
+		tenantID   string
+		orgID      *string
+		segmentIDs []string
+		expected   string
 	}{
-		{"tenant1", nil, "tenant1"},
-		{"tenant1", strPtr(""), "tenant1"},
-		{"tenant1", strPtr("org1"), "tenant1:org1"},
+		{"tenant1", nil, nil, "tenant1"},
+		{"tenant1", strPtr(""), nil, "tenant1"},
+		{"tenant1", strPtr("org1"), nil, "tenant1:org1"},
+		// #3051 (ADR-060 P3): segment set appended as a distinct, delimited
+		// suffix so a segment-scoped cache entry can never collide with (or
+		// be silently read back as) the base entry.
+		{"tenant1", nil, []string{"finance"}, "tenant1:seg=finance"},
+		{"tenant1", strPtr("org1"), []string{"finance"}, "tenant1:org1:seg=finance"},
+		// Caller MUST pass an already-normalized (sorted, deduped) set —
+		// buildCacheKey itself does not re-normalize (see its doc); this
+		// pins that it is a pure join, not a second normalization pass.
+		{"tenant1", nil, []string{"finance", "ml-platform"}, "tenant1:seg=finance,ml-platform"},
 	}
 
 	for _, tt := range tests {
-		result := engine.buildCacheKey(tt.tenantID, tt.orgID)
+		result := engine.buildCacheKey(tt.tenantID, tt.orgID, tt.segmentIDs)
 		if result != tt.expected {
-			t.Errorf("buildCacheKey(%s, %v) = %s, want %s", tt.tenantID, tt.orgID, result, tt.expected)
+			t.Errorf("buildCacheKey(%s, %v, %v) = %s, want %s", tt.tenantID, tt.orgID, tt.segmentIDs, result, tt.expected)
 		}
 	}
 }
@@ -506,26 +529,15 @@ func TestTierAwarePolicyEngine_EvaluatePolicy_RequireApproval(t *testing.T) {
 	testTime := time.Date(2025, 1, 1, 0, 0, 0, 0, time.UTC)
 
 	// Setup mock with a require_approval policy (HITL)
-	rows := sqlmock.NewRows([]string{
-		"id", "policy_id", "name", "category", "pattern", "severity",
-		"description", "action", "tier", "priority", "enabled",
-		"organization_id", "tenant_id", "org_id",
-		"tags", "metadata", "version",
-		"created_at", "updated_at", "created_by", "updated_by",
-		"override_id", "action_override", "enabled_override",
-		"expires_at", "override_reason",
-	}).
-		AddRow(
-			"uuid-hitl", "hitl_credit_scoring", "Credit Scoring HITL", "sensitive-data", `(?i)credit\s*scor`, "critical",
-			"Requires human approval for credit scoring decisions", "require_approval", "tenant", 100, true,
-			nil, tenantID, "",
-			"[]", "{}", 1,
-			testTime, testTime, "admin", "admin",
-			nil, nil, nil, nil, nil,
-		)
-
-	mock.ExpectQuery(`SELECT.*FROM static_policies`).
-		WillReturnRows(rows)
+	tenantRows := sqlmock.NewRows(effectiveCols()).AddRow(
+		"uuid-hitl", "hitl_credit_scoring", "Credit Scoring HITL", "sensitive-data", `(?i)credit\s*scor`, "critical",
+		"Requires human approval for credit scoring decisions", "require_approval", "tenant", 100, true,
+		nil, tenantID, "", nil,
+		"[]", "{}", 1,
+		testTime, testTime, "admin", "admin",
+	)
+	globalRows := sqlmock.NewRows(effectiveCols())
+	expectEffectiveTwoPass(mock, tenantID, tenantRows, emptyOverrideRows(), globalRows, nil)
 
 	engine := NewTierAwarePolicyEngine(db, nil)
 
@@ -559,7 +571,7 @@ func TestTierAwarePolicyEngine_EvaluatePolicy_RequireApproval(t *testing.T) {
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			result, err := engine.EvaluatePolicy(context.Background(), tenantID, nil, tt.input)
+			result, err := engine.EvaluatePolicy(context.Background(), tenantID, nil, nil, tt.input)
 			if err != nil {
 				t.Fatalf("unexpected error: %v", err)
 			}
@@ -580,7 +592,6 @@ func TestTierAwarePolicyEngine_EvaluatePolicy_RequireApproval(t *testing.T) {
 	}
 }
 
-
 // TestTierAwarePolicyEngine_GetEffectivePoliciesByCategory tests filtering by category
 func TestTierAwarePolicyEngine_GetEffectivePoliciesByCategory(t *testing.T) {
 	db, mock, err := sqlmock.New()
@@ -593,39 +604,26 @@ func TestTierAwarePolicyEngine_GetEffectivePoliciesByCategory(t *testing.T) {
 	testTime := time.Date(2025, 1, 1, 0, 0, 0, 0, time.UTC)
 
 	// Setup mock with multiple categories
-	rows := sqlmock.NewRows([]string{
-		"id", "policy_id", "name", "category", "pattern", "severity",
-		"description", "action", "tier", "priority", "enabled",
-		"organization_id", "tenant_id", "org_id",
-		"tags", "metadata", "version",
-		"created_at", "updated_at", "created_by", "updated_by",
-		"override_id", "action_override", "enabled_override",
-		"expires_at", "override_reason",
-	}).
-		AddRow(
-			"uuid-1", "sqli_policy", "SQL Injection", "security-sqli", `union\s+select`, "critical",
-			"Blocks UNION-based SQL injection", "block", "system", 100, true,
-			nil, "global", "",
-			"[]", "{}", 1,
-			testTime, testTime, "system", "system",
-			nil, nil, nil, nil, nil,
-		).
-		AddRow(
-			"uuid-2", "pii_policy", "PII SSN", "pii-us", `\d{3}-\d{2}-\d{4}`, "high",
-			"Detects SSN", "redact", "tenant", 50, true,
-			nil, tenantID, "",
-			"[]", "{}", 1,
-			testTime, testTime, "user", "user",
-			nil, nil, nil, nil, nil,
-		)
-
-	mock.ExpectQuery(`SELECT.*FROM static_policies`).
-		WillReturnRows(rows)
+	tenantRows := sqlmock.NewRows(effectiveCols()).AddRow(
+		"uuid-2", "pii_policy", "PII SSN", "pii-us", `\d{3}-\d{2}-\d{4}`, "high",
+		"Detects SSN", "redact", "tenant", 50, true,
+		nil, tenantID, "", nil,
+		"[]", "{}", 1,
+		testTime, testTime, "user", "user",
+	)
+	globalRows := sqlmock.NewRows(effectiveCols()).AddRow(
+		"uuid-1", "sqli_policy", "SQL Injection", "security-sqli", `union\s+select`, "critical",
+		"Blocks UNION-based SQL injection", "block", "system", 100, true,
+		nil, "global", "", nil,
+		"[]", "{}", 1,
+		testTime, testTime, "system", "system",
+	)
+	expectEffectiveTwoPass(mock, tenantID, tenantRows, emptyOverrideRows(), globalRows, nil)
 
 	engine := NewTierAwarePolicyEngine(db, nil)
 
 	// Get policies by security-sqli category
-	policies, err := engine.GetEffectivePoliciesByCategory(context.Background(), tenantID, nil, "security-sqli")
+	policies, err := engine.GetEffectivePoliciesByCategory(context.Background(), tenantID, nil, nil, "security-sqli")
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
@@ -638,7 +636,7 @@ func TestTierAwarePolicyEngine_GetEffectivePoliciesByCategory(t *testing.T) {
 	}
 
 	// Get policies by pii-us category (should use cache)
-	piiPolicies, err := engine.GetEffectivePoliciesByCategory(context.Background(), tenantID, nil, "pii-us")
+	piiPolicies, err := engine.GetEffectivePoliciesByCategory(context.Background(), tenantID, nil, nil, "pii-us")
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
@@ -660,39 +658,26 @@ func TestTierAwarePolicyEngine_GetEffectivePoliciesByTier(t *testing.T) {
 	testTime := time.Date(2025, 1, 1, 0, 0, 0, 0, time.UTC)
 
 	// Setup mock with multiple tiers
-	rows := sqlmock.NewRows([]string{
-		"id", "policy_id", "name", "category", "pattern", "severity",
-		"description", "action", "tier", "priority", "enabled",
-		"organization_id", "tenant_id", "org_id",
-		"tags", "metadata", "version",
-		"created_at", "updated_at", "created_by", "updated_by",
-		"override_id", "action_override", "enabled_override",
-		"expires_at", "override_reason",
-	}).
-		AddRow(
-			"uuid-1", "system_policy", "System Policy", "security-sqli", `union\s+select`, "critical",
-			"System-level policy", "block", "system", 100, true,
-			nil, "global", "",
-			"[]", "{}", 1,
-			testTime, testTime, "system", "system",
-			nil, nil, nil, nil, nil,
-		).
-		AddRow(
-			"uuid-2", "tenant_policy", "Tenant Policy", "pii-us", `\d{3}-\d{2}-\d{4}`, "high",
-			"Tenant-level policy", "redact", "tenant", 50, true,
-			nil, tenantID, "",
-			"[]", "{}", 1,
-			testTime, testTime, "user", "user",
-			nil, nil, nil, nil, nil,
-		)
-
-	mock.ExpectQuery(`SELECT.*FROM static_policies`).
-		WillReturnRows(rows)
+	tenantRows := sqlmock.NewRows(effectiveCols()).AddRow(
+		"uuid-2", "tenant_policy", "Tenant Policy", "pii-us", `\d{3}-\d{2}-\d{4}`, "high",
+		"Tenant-level policy", "redact", "tenant", 50, true,
+		nil, tenantID, "", nil,
+		"[]", "{}", 1,
+		testTime, testTime, "user", "user",
+	)
+	globalRows := sqlmock.NewRows(effectiveCols()).AddRow(
+		"uuid-1", "system_policy", "System Policy", "security-sqli", `union\s+select`, "critical",
+		"System-level policy", "block", "system", 100, true,
+		nil, "global", "", nil,
+		"[]", "{}", 1,
+		testTime, testTime, "system", "system",
+	)
+	expectEffectiveTwoPass(mock, tenantID, tenantRows, emptyOverrideRows(), globalRows, nil)
 
 	engine := NewTierAwarePolicyEngine(db, nil)
 
 	// Get policies by system tier
-	systemPolicies, err := engine.GetEffectivePoliciesByTier(context.Background(), tenantID, nil, TierSystem)
+	systemPolicies, err := engine.GetEffectivePoliciesByTier(context.Background(), tenantID, nil, nil, TierSystem)
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
@@ -705,7 +690,7 @@ func TestTierAwarePolicyEngine_GetEffectivePoliciesByTier(t *testing.T) {
 	}
 
 	// Get policies by tenant tier (should use cache)
-	tenantPolicies, err := engine.GetEffectivePoliciesByTier(context.Background(), tenantID, nil, TierTenant)
+	tenantPolicies, err := engine.GetEffectivePoliciesByTier(context.Background(), tenantID, nil, nil, TierTenant)
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}

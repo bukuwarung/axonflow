@@ -2,7 +2,7 @@
 
 **Last Updated:** April 2026
 
-**Platform Version:** v5.0.0 | **SDK Version:** v5.0.0
+**Platform Version:** 9.14.0 | **SDK Version:** 9.0.0
 
 AxonFlow provides multiple interfaces for inspecting workflow executions: the `axonctl` CLI, an embedded web UI, the REST API (via curl or SDK), and SDK clients in Go, Python, TypeScript, and Java.
 
@@ -264,7 +264,7 @@ import (
     "fmt"
     "os"
 
-    "github.com/getaxonflow/axonflow-sdk-go/v8"
+    "github.com/getaxonflow/axonflow-sdk-go/v9"
 )
 
 func main() {
@@ -356,8 +356,8 @@ for (const step of detail.steps ?? []) {
 ### Java
 
 ```java
-import com.axonflow.sdk.AxonFlowClient;
-import com.axonflow.sdk.model.Execution;
+import com.getaxonflow.sdk.AxonFlowClient;
+import com.getaxonflow.sdk.model.Execution;
 
 AxonFlowClient client = AxonFlowClient.builder()
     .endpoint(System.getenv("AXONFLOW_ENDPOINT"))

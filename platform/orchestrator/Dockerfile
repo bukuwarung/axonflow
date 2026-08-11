@@ -11,7 +11,7 @@ ARG EDITION=community
 # — the SAME source as the io.opencontainer.image.version label below, so the
 # baked binary version and the image label never drift. Re-declared here in the
 # builder stage (ARG scope is per-stage); the final stage declares it again.
-ARG AXONFLOW_VERSION=9.11.0
+ARG AXONFLOW_VERSION=9.16.0
 
 # Install git for go modules
 RUN apk add --no-cache git ca-certificates tzdata
@@ -27,6 +27,51 @@ RUN go mod download
 
 # Copy all source code from platform directory (Community core code)
 COPY platform/ .
+
+# ---------------------------------------------------------------------------
+# NO ee/platform/orchestrator OVERLAY. NOT ONE. (#3252, closing #3244.)
+#
+# This build used to copy ee/platform/orchestrator/{ojk,sebi,rbi,euaiact,
+# masfeat,llmadapters,agents} ON TOP of the platform packages that COPY had just
+# placed here. All seven blocks are gone, and the seven directories were deleted
+# with them, so there is no longer a second copy for a future block to point at.
+# `scripts/ci/check-no-compliance-overlay.sh` fails the build if any reference to
+# ee/platform/orchestrator reappears.
+#
+# WHY THIS MATTERED, kept because the failure mode is not obvious from the code.
+#
+# The ee/ twins carried the same file names and the same signatures with the
+# `//go:build enterprise` header stripped. So an overlaid build compiled
+# cleanly and the newer platform file simply stopped existing in the image: a
+# fix landed in platform/, passed every test, and never shipped. Nothing in the
+# repo could see it. `go build -tags enterprise ./...`, `go vet` and every unit
+# test operate on the source tree, which has no overlay.
+#
+# Two measured consequences, both of which bit:
+#
+#  1. SILENT REVERT WITH A SECURITY EDGE. platform/orchestrator/sebi wraps three
+#     audit-export reads in withOrgScope; the ee/ copy had ZERO, and no
+#     rls_session.go at all. The shipped enterprise sebi therefore ran those
+#     reads with no app.current_org_id set, under FORCE RLS, while the helper sat
+#     in the image defined-but-never-called (#3241).
+#
+#  2. BROKEN MIXTURE, NOT AN OLD PACKAGE. Overlaying stale same-named files onto
+#     a package that has gained NEW files gives "method already declared" plus
+#     "undefined type". Adding export_queries.go / framework.go / readiness.go /
+#     retention.go to platform/ojk while the overlay restored the old
+#     ojk_audit_export_service.go and types.go failed the image build.
+#     runtime-e2e/3242_ojk_pii_export caught it; nothing else did (#3242).
+#
+# The platform packages are `//go:build enterprise` tagged and this build passes
+# `-tags enterprise`, so they compile into the enterprise image exactly as the
+# overlaid copies did.
+#
+# WHAT IS STILL OVERLAID, so this is not misread as "built from platform/ alone":
+# ee/platform/agent/* (license, marketplace, node_enforcement, rbi, hitl,
+# circuitbreaker) and ee/platform/connectors, in the RUN block below. Those are a
+# different arrangement - they overlay packages that are STUBS in the platform
+# tree rather than full implementations - and they are out of #3252's scope.
+# ---------------------------------------------------------------------------
 
 # For enterprise builds from enterprise repo, copy ee/ agent code
 # The orchestrator imports agent package which needs enterprise code for:
@@ -54,41 +99,7 @@ RUN --mount=type=bind,source=.,target=/src \
         echo "  Copied enterprise Circuit Breaker module (EU AI Act Article 14)"; \
       fi && \
       echo "Enterprise agent code copied successfully" && \
-      echo "=== Copying EE compliance modules ===" && \
-      if [ -d "/src/ee/platform/orchestrator/sebi" ]; then \
-        cp -r /src/ee/platform/orchestrator/sebi/* ./orchestrator/sebi/ && \
-        echo "SEBI compliance module copied"; \
-      fi && \
-      if [ -d "/src/ee/platform/orchestrator/rbi" ]; then \
-        mkdir -p ./orchestrator/rbi/ && \
-        find /src/ee/platform/orchestrator/rbi -maxdepth 1 -type f ! -name "go.mod" ! -name "go.sum" -exec cp {} ./orchestrator/rbi/ \; && \
-        echo "RBI compliance module copied"; \
-      fi && \
-      if [ -d "/src/ee/platform/orchestrator/euaiact" ]; then \
-        mkdir -p ./orchestrator/euaiact/ && \
-        cp -r /src/ee/platform/orchestrator/euaiact/* ./orchestrator/euaiact/ && \
-        echo "EU AI Act compliance module copied"; \
-      fi && \
-      if [ -d "/src/ee/platform/orchestrator/masfeat" ]; then \
-        mkdir -p ./orchestrator/masfeat/ && \
-        cp -r /src/ee/platform/orchestrator/masfeat/* ./orchestrator/masfeat/ && \
-        echo "MAS FEAT compliance module copied"; \
-      fi && \
-      if [ -d "/src/ee/platform/orchestrator/ojk" ]; then \
-        mkdir -p ./orchestrator/ojk/ && \
-        cp -r /src/ee/platform/orchestrator/ojk/* ./orchestrator/ojk/ && \
-        echo "OJK compliance module copied (Indonesia)"; \
-      fi && \
-      if [ -d "/src/ee/platform/orchestrator/llmadapters" ]; then \
-        mkdir -p ./orchestrator/llmadapters/ && \
-        cp -r /src/ee/platform/orchestrator/llmadapters/* ./orchestrator/llmadapters/ && \
-        echo "LLM Adapters module copied (Bedrock support)"; \
-      fi && \
-      if [ -d "/src/ee/platform/orchestrator/agents" ]; then \
-        mkdir -p ./orchestrator/ee/agents/ && \
-        cp -r /src/ee/platform/orchestrator/agents/* ./orchestrator/ee/agents/ && \
-        echo "Agent CRUD handler module copied (DB Agent Config)"; \
-      fi && \
+      echo "=== EE orchestrator modules: none. All seven are built from platform/ (#3252) ===" && \
       echo "=== Copying EE connectors ===" && \
       if [ -d "/src/ee/platform/connectors" ]; then \
         cp -r /src/ee/platform/connectors/* ./connectors/ && \
@@ -149,7 +160,7 @@ RUN set -e && \
 # Final stage - minimal runtime image
 FROM alpine:3.24
 
-ARG AXONFLOW_VERSION=9.11.0
+ARG AXONFLOW_VERSION=9.16.0
 ENV AXONFLOW_VERSION=${AXONFLOW_VERSION}
 
 # AWS Marketplace metadata

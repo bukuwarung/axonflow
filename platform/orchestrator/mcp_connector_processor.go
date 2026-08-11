@@ -70,6 +70,56 @@ func init() {
 	serviceauth.LogAuthWarning()
 }
 
+// executionTenantID returns the tenancy a workflow execution is authorized to
+// resolve connectors under.
+//
+// It reads ONLY UserContext — never `execution.Input`, which is the
+// client-supplied request body and therefore forgeable. An empty result maps
+// to the deployment-shared scope in the registry, i.e. an identity-less
+// execution can reach the operator's own connectors and nothing tenant-owned.
+//
+// Be precise about where UserContext comes from, because it is NOT
+// unconditionally authoritative. Both execution entrypoints overlay it from
+// the agent's authenticated headers WHEN THOSE HEADERS ARE PRESENT:
+// executeWorkflowHandler re-derives User.TenantID/User.OrgID from
+// X-Tenant-ID/X-Org-ID inside `if header != ""` guards (run.go), and
+// executePlanHandler calls applyAuthoritativeIdentity, which returns early
+// when both headers are empty. `req.User` is itself a JSON body field, so a
+// caller that reaches the orchestrator directly with NO identity headers still
+// picks its own tenancy out of the body.
+//
+// That residual path is not this function's to close, and it is not a
+// regression: before #3066 (C3-1) the body was preferred OVER the header, so
+// the agent-proxied path is now strictly closed. What guarantees a
+// caller cannot reach the orchestrator without an authenticated identity in
+// the first place is the router-level gate in #3073 (#3064/#3068) — do not
+// read the paragraph above as the whole security argument.
+//
+// Precedence is TENANT-first, matching the connector registry's WRITER and its
+// other readers — not normalizeHITLScope, which is org-first (R3).
+//
+// The rule is "agree with the structure you are keying into", and the two
+// structures have different writers:
+//   - Connector registry: written by installConnectorHandler via
+//     resolveTenantID, which prefers X-Tenant-ID; read by
+//     gateway_handlers (user.TenantID), GetConnectorForTenant(tenantID, …) and
+//     the marketplace handlers. All tenant-first.
+//   - HITL execution store: written AND read through normalizeHITLScope itself,
+//     so that one is self-consistently org-first.
+//
+// OrgID and TenantID come from independent sources (the license payload vs the
+// client/customer record), so on a deployment where they diverge an org-first
+// reader here would miss the tenant's OWN connector — a lockout, not a leak.
+func executionTenantID(execution *WorkflowExecution) string {
+	if execution == nil {
+		return ""
+	}
+	if execution.UserContext.TenantID != "" {
+		return execution.UserContext.TenantID
+	}
+	return execution.UserContext.OrgID
+}
+
 // MCPConnectorProcessor handles workflow steps that call MCP connectors
 type MCPConnectorProcessor struct {
 	// No direct connector access - use global registry
@@ -88,12 +138,22 @@ func (p *MCPConnectorProcessor) ExecuteStep(ctx context.Context, step WorkflowSt
 		return nil, fmt.Errorf("connector name not specified in step %s", step.Name)
 	}
 
-	// Try local registry first
+	// Try local registry first.
+	//
+	// #3067 (S-1, CRITICAL): connectorName is caller-supplied — it arrives
+	// verbatim from `step.connector` in the POST /api/v1/workflows/execute and
+	// MAP plan-execute bodies. It used to be handed to a flat, deployment-wide,
+	// name-keyed map, so a tenant could name ANOTHER tenant's connector and
+	// have the statement executed against it with the victim's ConnectionURL
+	// and decrypted Credentials. The lookup is now scoped to the execution's
+	// authenticated tenancy, which the handlers overlay from the agent's auth
+	// chain (X-Tenant-ID / X-Org-ID) before the workflow is built — so naming
+	// a foreign connector simply resolves nothing.
 	var connector base.Connector
 	var localConnectorErr error
 
 	if connectorRegistry != nil {
-		connector, localConnectorErr = connectorRegistry.Get(connectorName)
+		connector, localConnectorErr = connectorRegistry.Get(executionTenantID(execution), connectorName)
 	}
 
 	// If connector not found locally, route to agent via MCPQueryRouter
@@ -146,7 +206,7 @@ func (p *MCPConnectorProcessor) ExecuteStep(ctx context.Context, step WorkflowSt
 	} else {
 		// Query operation (read)
 		query := &base.Query{
-			Statement:  step.Statement,  // e.g., "search_flights" for Amadeus
+			Statement:  step.Statement, // e.g., "search_flights" for Amadeus
 			Parameters: params,
 		}
 
@@ -269,12 +329,12 @@ func (p *MCPConnectorProcessor) formatResponse(stepName string, rows []map[strin
 
 	// Generic formatting
 	var builder strings.Builder
-	fmt.Fprintf(&builder,"Found %d result(s):\n\n", len(rows))
+	fmt.Fprintf(&builder, "Found %d result(s):\n\n", len(rows))
 
 	for i, row := range rows {
-		fmt.Fprintf(&builder,"%d. ", i+1)
+		fmt.Fprintf(&builder, "%d. ", i+1)
 		for k, v := range row {
-			fmt.Fprintf(&builder,"%s: %v, ", k, v)
+			fmt.Fprintf(&builder, "%s: %v, ", k, v)
 		}
 		builder.WriteString("\n")
 	}
@@ -285,14 +345,14 @@ func (p *MCPConnectorProcessor) formatResponse(stepName string, rows []map[strin
 // formatFlightResults formats flight search results
 func (p *MCPConnectorProcessor) formatFlightResults(rows []map[string]interface{}) string {
 	var builder strings.Builder
-	fmt.Fprintf(&builder,"Found %d flight option(s):\n\n", len(rows))
+	fmt.Fprintf(&builder, "Found %d flight option(s):\n\n", len(rows))
 
 	for i, row := range rows {
-		fmt.Fprintf(&builder,"Option %d:\n", i+1)
+		fmt.Fprintf(&builder, "Option %d:\n", i+1)
 
 		if price, ok := row["price"].(map[string]interface{}); ok {
 			if total, ok := price["total"].(string); ok {
-				fmt.Fprintf(&builder,"  Price: %s\n", total)
+				fmt.Fprintf(&builder, "  Price: %s\n", total)
 			}
 		}
 
@@ -300,7 +360,7 @@ func (p *MCPConnectorProcessor) formatFlightResults(rows []map[string]interface{
 			builder.WriteString("  Itinerary:\n")
 			// Format first itinerary
 			// (In production, would parse full Amadeus response structure)
-			fmt.Fprintf(&builder,"    %v\n", itineraries[0])
+			fmt.Fprintf(&builder, "    %v\n", itineraries[0])
 		}
 
 		builder.WriteString("\n")
@@ -312,17 +372,17 @@ func (p *MCPConnectorProcessor) formatFlightResults(rows []map[string]interface{
 // formatHotelResults formats hotel search results
 func (p *MCPConnectorProcessor) formatHotelResults(rows []map[string]interface{}) string {
 	var builder strings.Builder
-	fmt.Fprintf(&builder,"Found %d hotel option(s):\n\n", len(rows))
+	fmt.Fprintf(&builder, "Found %d hotel option(s):\n\n", len(rows))
 
 	for i, row := range rows {
-		fmt.Fprintf(&builder,"%d. ", i+1)
+		fmt.Fprintf(&builder, "%d. ", i+1)
 
 		if name, ok := row["name"].(string); ok {
-			fmt.Fprintf(&builder,"%s - ", name)
+			fmt.Fprintf(&builder, "%s - ", name)
 		}
 
 		if price, ok := row["price"].(string); ok {
-			fmt.Fprintf(&builder,"$%s/night", price)
+			fmt.Fprintf(&builder, "$%s/night", price)
 		}
 
 		builder.WriteString("\n")
@@ -355,10 +415,10 @@ func (p *MCPConnectorProcessor) routeToAgent(ctx context.Context, step WorkflowS
 		User:        UserContext{}, // Will be populated from execution context if available
 		Client:      ClientContext{},
 		Context: map[string]interface{}{
-			"connector":  connectorName,
-			"params":     params,
-			"operation":  operation,
-			"step_name":  step.Name,
+			"connector": connectorName,
+			"params":    params,
+			"operation": operation,
+			"step_name": step.Name,
 		},
 		Timestamp: time.Now(),
 	}
@@ -372,18 +432,27 @@ func (p *MCPConnectorProcessor) routeToAgent(ctx context.Context, step WorkflowS
 	// Uses HMAC-signed token if secret is configured, otherwise falls back to hardcoded token
 	req.Context["user_token"] = serviceauth.GetInternalServiceToken(internalTokenGenerator)
 
-	if execution.Input != nil {
-		if clientID, ok := execution.Input["client_id"].(string); ok && clientID != "" {
-			req.Client.ID = clientID
-		}
-		if tenantID, ok := execution.Input["tenant_id"].(string); ok && tenantID != "" {
-			req.Client.TenantID = tenantID
-			req.User.TenantID = tenantID
-		}
-		if userToken, ok := execution.Input["user_token"].(string); ok && userToken != "" {
-			req.Context["user_token"] = userToken
-		}
+	// #3067 (R3 BLOCKER): the tenancy of a routed connector call comes from the
+	// execution's AUTHENTICATED identity, never from execution.Input.
+	//
+	// This is the bypass of the local fix above. When the tenant-scoped local
+	// lookup misses — which is precisely what happens when a caller names
+	// ANOTHER tenant's connector — control lands here, and this block used to
+	// let the request body pick the tenancy. The agent's internal-service auth
+	// path adopts that value verbatim (authenticator.go: `tenantID :=
+	// hints.TenantID`), so `{"input": {"tenant_id": "<victim>"}}` re-acquired
+	// the victim's connector on the agent side, with the victim's decrypted
+	// credentials — the very execution the local re-keying denies.
+	if tenantID := executionTenantID(execution); tenantID != "" {
+		req.Client.TenantID = tenantID
+		req.User.TenantID = tenantID
 	}
+
+	// Nothing else is read from execution.Input. The previous `client_id` and
+	// `user_token` overrides were already dead — RouteToAgent hardcodes
+	// serviceauth.ClientID and re-derives the internal-service token — and
+	// leaving them in place would arm a body-supplied service token the day
+	// RouteToAgent started honouring them (R3).
 
 	log.Printf("[MCP] Routing connector '%s' operation '%s' to agent - step: %s", connectorName, operation, step.Name)
 

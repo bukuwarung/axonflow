@@ -128,9 +128,14 @@ func TestGetOverrideHandler_TenantScopedLookup(t *testing.T) {
 		}).AddRow("ov-1", "pol-1", "static", "tenant-x", nil, nil,
 			"reason", expiresAt, "user@x.com", time.Now(), nil, nil)
 
+		mock.ExpectBegin()
+		mock.ExpectExec("SELECT set_config\\('app.current_org_id', \\$1, true\\)").
+			WithArgs("tenant-x").
+			WillReturnResult(sqlmock.NewResult(0, 0))
 		mock.ExpectQuery("SELECT .+ FROM policy_overrides WHERE id = \\$1 AND tenant_id = \\$2").
 			WithArgs("ov-1", "tenant-x").
 			WillReturnRows(rows)
+		mock.ExpectCommit()
 
 		req := httptest.NewRequest("GET", "/api/v1/overrides/ov-1", nil)
 		req = mux.SetURLVars(req, map[string]string{"id": "ov-1"})
@@ -146,9 +151,14 @@ func TestGetOverrideHandler_TenantScopedLookup(t *testing.T) {
 
 func TestGetOverrideHandler_NotFound(t *testing.T) {
 	withUsageDB(t, func(mock sqlmock.Sqlmock) {
+		mock.ExpectBegin()
+		mock.ExpectExec("SELECT set_config\\('app.current_org_id', \\$1, true\\)").
+			WithArgs("tenant-x").
+			WillReturnResult(sqlmock.NewResult(0, 0))
 		mock.ExpectQuery("SELECT .+ FROM policy_overrides").
 			WithArgs("ov-missing", "tenant-x").
 			WillReturnError(sql.ErrNoRows)
+		mock.ExpectRollback()
 
 		req := httptest.NewRequest("GET", "/api/v1/overrides/ov-missing", nil)
 		req = mux.SetURLVars(req, map[string]string{"id": "ov-missing"})
@@ -165,7 +175,7 @@ func TestGetOverrideHandler_NotFound(t *testing.T) {
 // --- policyRiskAndOverride ---
 
 func TestPolicyRiskAndOverride_InvalidType(t *testing.T) {
-	_, _, _, err := policyRiskAndOverride(nil, "pol-1", "invalid")
+	_, _, _, err := policyRiskAndOverride(context.Background(), nil, "tenant-1", "pol-1", "invalid")
 	if err == nil || !strings.Contains(err.Error(), "invalid policy_type") {
 		t.Errorf("expected invalid type error, got %v", err)
 	}
@@ -173,11 +183,15 @@ func TestPolicyRiskAndOverride_InvalidType(t *testing.T) {
 
 func TestPolicyRiskAndOverride_StaticHappyPath(t *testing.T) {
 	withUsageDB(t, func(mock sqlmock.Sqlmock) {
+		// #3039: lookup runs org-scoped (BEGIN + set_config + SELECT + COMMIT).
+		mock.ExpectBegin()
+		mock.ExpectExec("SELECT set_config\\('app.current_org_id', \\$1, true\\)").WithArgs("tenant-1").WillReturnResult(sqlmock.NewResult(0, 0))
 		mock.ExpectQuery("SELECT risk_level, allow_override, id::text").
-			WithArgs("pol-1").
+			WithArgs("pol-1", "tenant-1").
 			WillReturnRows(sqlmock.NewRows([]string{"risk_level", "allow_override", "id"}).
 				AddRow("high", true, "00000000-0000-0000-0000-000000000001"))
-		risk, ao, uuid, err := policyRiskAndOverride(usageDB, "pol-1", "static")
+		mock.ExpectCommit()
+		risk, ao, uuid, err := policyRiskAndOverride(context.Background(), usageDB, "tenant-1", "pol-1", "static")
 		if err != nil {
 			t.Fatalf("unexpected error: %v", err)
 		}
@@ -192,10 +206,21 @@ func TestPolicyRiskAndOverride_StaticHappyPath(t *testing.T) {
 
 func TestPolicyRiskAndOverride_DynamicNotFound(t *testing.T) {
 	withUsageDB(t, func(mock sqlmock.Sqlmock) {
+		// #3039: tenant-scope pass misses, then the 'global'-scope pass
+		// misses too — ErrNoRows must surface unchanged.
+		mock.ExpectBegin()
+		mock.ExpectExec("SELECT set_config\\('app.current_org_id', \\$1, true\\)").WithArgs("tenant-1").WillReturnResult(sqlmock.NewResult(0, 0))
 		mock.ExpectQuery("SELECT COALESCE\\(risk_level").
-			WithArgs("pol-x").
+			WithArgs("pol-x", "tenant-1").
 			WillReturnError(sql.ErrNoRows)
-		_, _, _, err := policyRiskAndOverride(usageDB, "pol-x", "dynamic")
+		mock.ExpectRollback()
+		mock.ExpectBegin()
+		mock.ExpectExec("SELECT set_config\\('app.current_org_id', \\$1, true\\)").WithArgs("global").WillReturnResult(sqlmock.NewResult(0, 0))
+		mock.ExpectQuery("SELECT COALESCE\\(risk_level").
+			WithArgs("pol-x", "tenant-1").
+			WillReturnError(sql.ErrNoRows)
+		mock.ExpectRollback()
+		_, _, _, err := policyRiskAndOverride(context.Background(), usageDB, "tenant-1", "pol-x", "dynamic")
 		if err != sql.ErrNoRows {
 			t.Errorf("error = %v, want sql.ErrNoRows", err)
 		}
@@ -206,10 +231,13 @@ func TestPolicyRiskAndOverride_DynamicNotFound(t *testing.T) {
 
 func TestCreateOverrideHandler_RejectsCriticalRisk(t *testing.T) {
 	withUsageDB(t, func(mock sqlmock.Sqlmock) {
+		mock.ExpectBegin()
+		mock.ExpectExec("SELECT set_config\\('app.current_org_id', \\$1, true\\)").WithArgs("tenant-x").WillReturnResult(sqlmock.NewResult(0, 0))
 		mock.ExpectQuery("SELECT risk_level, allow_override, id::text").
-			WithArgs("pol-crit").
+			WithArgs("pol-crit", "tenant-x").
 			WillReturnRows(sqlmock.NewRows([]string{"risk_level", "allow_override", "id"}).
 				AddRow("critical", false, "00000000-0000-0000-0000-000000000001"))
+		mock.ExpectCommit()
 
 		body, _ := json.Marshal(CreateOverrideRequest{
 			PolicyID: "pol-crit", PolicyType: "static", OverrideReason: "test",
@@ -228,10 +256,13 @@ func TestCreateOverrideHandler_RejectsCriticalRisk(t *testing.T) {
 
 func TestCreateOverrideHandler_RejectsAllowOverrideFalse(t *testing.T) {
 	withUsageDB(t, func(mock sqlmock.Sqlmock) {
+		mock.ExpectBegin()
+		mock.ExpectExec("SELECT set_config\\('app.current_org_id', \\$1, true\\)").WithArgs("tenant-x").WillReturnResult(sqlmock.NewResult(0, 0))
 		mock.ExpectQuery("SELECT COALESCE\\(risk_level").
-			WithArgs("pol-1").
+			WithArgs("pol-1", "tenant-x").
 			WillReturnRows(sqlmock.NewRows([]string{"risk_level", "allow_override", "id"}).
 				AddRow("medium", false, "00000000-0000-0000-0000-000000000001"))
+		mock.ExpectCommit()
 
 		body, _ := json.Marshal(CreateOverrideRequest{
 			PolicyID: "pol-1", PolicyType: "dynamic", OverrideReason: "test",
@@ -250,9 +281,18 @@ func TestCreateOverrideHandler_RejectsAllowOverrideFalse(t *testing.T) {
 
 func TestCreateOverrideHandler_PolicyNotFound(t *testing.T) {
 	withUsageDB(t, func(mock sqlmock.Sqlmock) {
+		mock.ExpectBegin()
+		mock.ExpectExec("SELECT set_config\\('app.current_org_id', \\$1, true\\)").WithArgs("tenant-x").WillReturnResult(sqlmock.NewResult(0, 0))
 		mock.ExpectQuery("SELECT risk_level, allow_override, id::text").
-			WithArgs("pol-missing").
+			WithArgs("pol-missing", "tenant-x").
 			WillReturnError(sql.ErrNoRows)
+		mock.ExpectRollback()
+		mock.ExpectBegin()
+		mock.ExpectExec("SELECT set_config\\('app.current_org_id', \\$1, true\\)").WithArgs("global").WillReturnResult(sqlmock.NewResult(0, 0))
+		mock.ExpectQuery("SELECT risk_level, allow_override, id::text").
+			WithArgs("pol-missing", "tenant-x").
+			WillReturnError(sql.ErrNoRows)
+		mock.ExpectRollback()
 
 		body, _ := json.Marshal(CreateOverrideRequest{
 			PolicyID: "pol-missing", PolicyType: "static", OverrideReason: "test",
@@ -273,9 +313,14 @@ func TestCreateOverrideHandler_PolicyNotFound(t *testing.T) {
 
 func TestRevokeOverrideHandler_NotFound(t *testing.T) {
 	withUsageDB(t, func(mock sqlmock.Sqlmock) {
+		mock.ExpectBegin()
+		mock.ExpectExec("SELECT set_config\\('app.current_org_id', \\$1, true\\)").
+			WithArgs("tenant-x").
+			WillReturnResult(sqlmock.NewResult(0, 0))
 		mock.ExpectQuery("SELECT policy_id, created_by FROM policy_overrides").
 			WithArgs("ov-missing", "tenant-x").
 			WillReturnError(sql.ErrNoRows)
+		mock.ExpectRollback()
 
 		req := httptest.NewRequest("DELETE", "/api/v1/overrides/ov-missing", nil)
 		req = mux.SetURLVars(req, map[string]string{"id": "ov-missing"})
@@ -337,8 +382,13 @@ func TestExplainDecisionHandler_HappyPath(t *testing.T) {
 		mock.ExpectQuery("SELECT COUNT\\(\\*\\) FROM audit_logs").
 			WillReturnRows(sqlmock.NewRows([]string{"count"}).AddRow(2))
 		// override availability check
+		mock.ExpectBegin()
+		mock.ExpectExec("SELECT set_config\\('app.current_org_id', \\$1, true\\)").
+			WithArgs("tenant-x").
+			WillReturnResult(sqlmock.NewResult(0, 0))
 		mock.ExpectQuery("SELECT id FROM policy_overrides").
 			WillReturnError(sql.ErrNoRows)
+		mock.ExpectRollback()
 
 		req := httptest.NewRequest("GET", "/api/v1/decisions/dec-1/explain", nil)
 		req = mux.SetURLVars(req, map[string]string{"id": "dec-1"})
@@ -399,11 +449,16 @@ func TestExplainDecisionHandler_CrossTenantReturnsNoOracle(t *testing.T) {
 
 func TestCheckOverrideAvailability_WithActiveOverride(t *testing.T) {
 	withUsageDB(t, func(mock sqlmock.Sqlmock) {
+		mock.ExpectBegin()
+		mock.ExpectExec("SELECT set_config\\('app.current_org_id', \\$1, true\\)").
+			WithArgs("tenant-x").
+			WillReturnResult(sqlmock.NewResult(0, 0))
 		mock.ExpectQuery("SELECT id FROM policy_overrides").
 			WithArgs("p-1", "dev@x.com", "tenant-x", "").
 			WillReturnRows(sqlmock.NewRows([]string{"id"}).AddRow("ov-existing"))
+		mock.ExpectCommit()
 
-		ok, id := checkOverrideAvailability("tenant-x", "dev@x.com", "",
+		ok, id := checkOverrideAvailability("tenant-x", "tenant-x", "dev@x.com", "",
 			[]ExplainPolicy{{PolicyID: "p-1", RiskLevel: "medium", AllowOverride: true}})
 		if !ok {
 			t.Error("expected available=true")
@@ -416,10 +471,15 @@ func TestCheckOverrideAvailability_WithActiveOverride(t *testing.T) {
 
 func TestCheckOverrideAvailability_NoActiveOverride(t *testing.T) {
 	withUsageDB(t, func(mock sqlmock.Sqlmock) {
+		mock.ExpectBegin()
+		mock.ExpectExec("SELECT set_config\\('app.current_org_id', \\$1, true\\)").
+			WithArgs("tenant-x").
+			WillReturnResult(sqlmock.NewResult(0, 0))
 		mock.ExpectQuery("SELECT id FROM policy_overrides").
 			WillReturnError(sql.ErrNoRows)
+		mock.ExpectRollback()
 
-		ok, id := checkOverrideAvailability("tenant-x", "dev@x.com", "",
+		ok, id := checkOverrideAvailability("tenant-x", "tenant-x", "dev@x.com", "",
 			[]ExplainPolicy{{PolicyID: "p-1", RiskLevel: "medium", AllowOverride: true}})
 		if !ok {
 			t.Error("expected available=true (policy is overridable, no existing override)")
@@ -435,11 +495,16 @@ func TestCheckOverrideAvailability_NoActiveOverride(t *testing.T) {
 func TestApplyOverrideToResult_SkipsCriticalAndUsesNonCritical(t *testing.T) {
 	withUsageDB(t, func(mock sqlmock.Sqlmock) {
 		expiresAt := time.Now().Add(time.Hour)
+		mock.ExpectBegin()
+		mock.ExpectExec("SELECT set_config\\('app.current_org_id', \\$1, true\\)").
+			WithArgs("tenant-x").
+			WillReturnResult(sqlmock.NewResult(0, 0))
 		mock.ExpectQuery("SELECT id, policy_id, policy_type.+FROM policy_overrides").
 			WithArgs("p-medium", "dev@x.com", "tenant-x", "").
 			WillReturnRows(sqlmock.NewRows([]string{
 				"id", "policy_id", "policy_type", "tool_signature", "override_reason", "expires_at",
 			}).AddRow("ov-1", "p-medium", "dynamic", "", "reason", expiresAt))
+		mock.ExpectCommit()
 
 		result := &PolicyEvaluationResult{
 			Allowed: false,
@@ -465,11 +530,16 @@ func TestFindActiveOverride_HappyPath(t *testing.T) {
 			"id", "policy_id", "policy_type", "tool_signature", "override_reason", "expires_at",
 		}).AddRow("ov-1", "pol-1", "static", "", "test reason", expiresAt)
 
+		mock.ExpectBegin()
+		mock.ExpectExec("SELECT set_config\\('app.current_org_id', \\$1, true\\)").
+			WithArgs("tenant-x").
+			WillReturnResult(sqlmock.NewResult(0, 0))
 		mock.ExpectQuery("SELECT id, policy_id, policy_type.+FROM policy_overrides").
 			WithArgs("pol-1", "dev@x.com", "tenant-x", "").
 			WillReturnRows(rows)
+		mock.ExpectCommit()
 
-		ov, err := FindActiveOverride(context.Background(), usageDB, "tenant-x", "dev@x.com", "pol-1", "")
+		ov, err := FindActiveOverride(context.Background(), usageDB, "tenant-x", "tenant-x", "dev@x.com", "pol-1", "")
 		if err != nil {
 			t.Fatalf("unexpected error: %v", err)
 		}
@@ -484,10 +554,15 @@ func TestFindActiveOverride_HappyPath(t *testing.T) {
 
 func TestFindActiveOverride_NotFound(t *testing.T) {
 	withUsageDB(t, func(mock sqlmock.Sqlmock) {
+		mock.ExpectBegin()
+		mock.ExpectExec("SELECT set_config\\('app.current_org_id', \\$1, true\\)").
+			WithArgs("tenant-x").
+			WillReturnResult(sqlmock.NewResult(0, 0))
 		mock.ExpectQuery("SELECT id, policy_id, policy_type.+FROM policy_overrides").
 			WillReturnError(sql.ErrNoRows)
+		mock.ExpectRollback()
 
-		ov, err := FindActiveOverride(context.Background(), usageDB, "tenant-x", "dev@x.com", "pol-1", "")
+		ov, err := FindActiveOverride(context.Background(), usageDB, "tenant-x", "tenant-x", "dev@x.com", "pol-1", "")
 		if err != nil {
 			t.Errorf("unexpected error: %v", err)
 		}
@@ -553,8 +628,13 @@ func TestApplyOverrideToResult_FlipsOnActiveOverride(t *testing.T) {
 			"id", "policy_id", "policy_type", "tool_signature", "override_reason", "expires_at",
 		}).AddRow("ov-1", "pol-1", "dynamic", "", "test reason", expiresAt)
 
+		mock.ExpectBegin()
+		mock.ExpectExec("SELECT set_config\\('app.current_org_id', \\$1, true\\)").
+			WithArgs("org-y"). // scope key = the passed org (R3 HIGH-3)
+			WillReturnResult(sqlmock.NewResult(0, 0))
 		mock.ExpectQuery("SELECT id, policy_id, policy_type.+FROM policy_overrides").
 			WillReturnRows(rows)
+		mock.ExpectCommit()
 
 		result := &PolicyEvaluationResult{
 			Allowed: false,
@@ -600,9 +680,12 @@ func TestCreateOverrideHandler_CriticalPolicyForbidden(t *testing.T) {
 	withUsageDB(t, func(mock sqlmock.Sqlmock) {
 		rows := sqlmock.NewRows([]string{"risk_level", "allow_override", "id"}).
 			AddRow("critical", false, "00000000-0000-0000-0000-000000000001")
+		mock.ExpectBegin()
+		mock.ExpectExec("SELECT set_config\\('app.current_org_id', \\$1, true\\)").WithArgs("tenant-x").WillReturnResult(sqlmock.NewResult(0, 0))
 		mock.ExpectQuery("SELECT risk_level, allow_override, id::text").
-			WithArgs("pol-critical").
+			WithArgs("pol-critical", "tenant-x").
 			WillReturnRows(rows)
+		mock.ExpectCommit()
 
 		body, _ := json.Marshal(CreateOverrideRequest{
 			PolicyID:       "pol-critical",
@@ -627,9 +710,12 @@ func TestCreateOverrideHandler_AllowOverrideFalse(t *testing.T) {
 	withUsageDB(t, func(mock sqlmock.Sqlmock) {
 		rows := sqlmock.NewRows([]string{"risk_level", "allow_override", "id"}).
 			AddRow("high", false, "00000000-0000-0000-0000-000000000001")
+		mock.ExpectBegin()
+		mock.ExpectExec("SELECT set_config\\('app.current_org_id', \\$1, true\\)").WithArgs("tenant-x").WillReturnResult(sqlmock.NewResult(0, 0))
 		mock.ExpectQuery("SELECT risk_level, allow_override, id::text").
-			WithArgs("pol-no-override").
+			WithArgs("pol-no-override", "tenant-x").
 			WillReturnRows(rows)
+		mock.ExpectCommit()
 
 		body, _ := json.Marshal(CreateOverrideRequest{
 			PolicyID:       "pol-no-override",
@@ -655,9 +741,12 @@ func TestCreateOverrideHandler_HappyPath(t *testing.T) {
 	withUsageDB(t, func(mock sqlmock.Sqlmock) {
 		riskRows := sqlmock.NewRows([]string{"risk_level", "allow_override", "id"}).
 			AddRow("medium", true, "00000000-0000-0000-0000-000000000001")
+		mock.ExpectBegin()
+		mock.ExpectExec("SELECT set_config\\('app.current_org_id', \\$1, true\\)").WithArgs("tenant-x").WillReturnResult(sqlmock.NewResult(0, 0))
 		mock.ExpectQuery("SELECT risk_level, allow_override, id::text").
-			WithArgs("pol-ok").
+			WithArgs("pol-ok", "tenant-x").
 			WillReturnRows(riskRows)
+		mock.ExpectCommit()
 		// v9 Phase 8 PR-C2 (#2384): INSERT wrapped in rls.WithOrgScope; scope
 		// is X-Org-ID if set, else X-Tenant-ID (tenant-x in this test).
 		mock.ExpectBegin()
@@ -706,9 +795,12 @@ func TestCreateOverrideHandler_TTLClamped(t *testing.T) {
 	withUsageDB(t, func(mock sqlmock.Sqlmock) {
 		riskRows := sqlmock.NewRows([]string{"risk_level", "allow_override", "id"}).
 			AddRow("low", true, "00000000-0000-0000-0000-000000000001")
+		mock.ExpectBegin()
+		mock.ExpectExec("SELECT set_config\\('app.current_org_id', \\$1, true\\)").WithArgs("tenant-x").WillReturnResult(sqlmock.NewResult(0, 0))
 		mock.ExpectQuery("SELECT risk_level, allow_override, id::text").
-			WithArgs("pol-ok").
+			WithArgs("pol-ok", "tenant-x").
 			WillReturnRows(riskRows)
+		mock.ExpectCommit()
 		// v9 Phase 8 PR-C2 (#2384): wrapped INSERT.
 		mock.ExpectBegin()
 		mock.ExpectExec("set_config").WithArgs("tenant-x").WillReturnResult(sqlmock.NewResult(0, 0))
@@ -748,9 +840,14 @@ func TestCreateOverrideHandler_TTLClamped(t *testing.T) {
 // TestRevokeOverrideHandler_HappyPath exercises the full 200 OK path.
 func TestRevokeOverrideHandler_HappyPath(t *testing.T) {
 	withUsageDB(t, func(mock sqlmock.Sqlmock) {
+		mock.ExpectBegin()
+		mock.ExpectExec("SELECT set_config\\('app.current_org_id', \\$1, true\\)").
+			WithArgs("tenant-x").
+			WillReturnResult(sqlmock.NewResult(0, 0))
 		mock.ExpectQuery("SELECT policy_id, created_by FROM policy_overrides").
 			WithArgs("ov-live", "tenant-x").
 			WillReturnRows(sqlmock.NewRows([]string{"policy_id", "created_by"}).AddRow("pol-1", "dev@example.com"))
+		mock.ExpectCommit()
 		// v9 Phase 8 PR-C2 (#2384): UPDATE wrapped in rls.WithOrgScope.
 		mock.ExpectBegin()
 		mock.ExpectExec("set_config").WithArgs("tenant-x").WillReturnResult(sqlmock.NewResult(0, 0))
@@ -803,9 +900,14 @@ func TestGetOverrideHandler_HappyPath(t *testing.T) {
 			nil, "debugging", expiresAt, "dev@example.com",
 			time.Now(), nil, nil)
 
+		mock.ExpectBegin()
+		mock.ExpectExec("SELECT set_config\\('app.current_org_id', \\$1, true\\)").
+			WithArgs("tenant-x").
+			WillReturnResult(sqlmock.NewResult(0, 0))
 		mock.ExpectQuery("SELECT .+ FROM policy_overrides WHERE id = .+ AND tenant_id").
 			WithArgs("ov-1", "tenant-x").
 			WillReturnRows(rows)
+		mock.ExpectCommit()
 
 		req := httptest.NewRequest("GET", "/api/v1/overrides/ov-1", nil)
 		req = mux.SetURLVars(req, map[string]string{"id": "ov-1"})
@@ -828,10 +930,13 @@ func TestListOverridesHandler_PolicyAndTenantScope(t *testing.T) {
 		// resolvePolicyUUID lookup chain: static first, then dynamic if
 		// static misses. For this fixture we answer static with a UUID
 		// that the handler will use as the actual WHERE value.
+		mock.ExpectBegin()
+		mock.ExpectExec("SELECT set_config\\('app.current_org_id', \\$1, true\\)").WithArgs("tenant-x").WillReturnResult(sqlmock.NewResult(0, 0))
 		mock.ExpectQuery("SELECT id::text FROM static_policies").
-			WithArgs("pol-1").
+			WithArgs("pol-1", "tenant-x").
 			WillReturnRows(sqlmock.NewRows([]string{"id"}).
 				AddRow("00000000-0000-0000-0000-000000000001"))
+		mock.ExpectCommit()
 
 		rows := sqlmock.NewRows([]string{
 			"id", "policy_id", "policy_type", "tenant_id",
@@ -860,10 +965,13 @@ func TestListOverridesHandler_PolicyAndTenantScope_IncludeRevoked(t *testing.T) 
 	withUsageDB(t, func(mock sqlmock.Sqlmock) {
 		revokedAt := time.Now().Add(-time.Minute)
 
+		mock.ExpectBegin()
+		mock.ExpectExec("SELECT set_config\\('app.current_org_id', \\$1, true\\)").WithArgs("tenant-x").WillReturnResult(sqlmock.NewResult(0, 0))
 		mock.ExpectQuery("SELECT id::text FROM static_policies").
-			WithArgs("pol-1").
+			WithArgs("pol-1", "tenant-x").
 			WillReturnRows(sqlmock.NewRows([]string{"id"}).
 				AddRow("00000000-0000-0000-0000-000000000001"))
+		mock.ExpectCommit()
 
 		rows := sqlmock.NewRows([]string{
 			"id", "policy_id", "policy_type", "tenant_id",
@@ -985,9 +1093,14 @@ func TestApplyOverrideToResult_HappyPath(t *testing.T) {
 			"id", "policy_id", "policy_type", "tool_signature", "override_reason", "expires_at",
 		}).AddRow("ov-1", "pol-med", "static", "", "debugging", nil)
 
+		mock.ExpectBegin()
+		mock.ExpectExec("SELECT set_config\\('app.current_org_id', \\$1, true\\)").
+			WithArgs("tenant-x").
+			WillReturnResult(sqlmock.NewResult(0, 0))
 		mock.ExpectQuery("SELECT id, policy_id, policy_type.+FROM policy_overrides").
 			WithArgs("pol-med", "dev@example.com", "tenant-x", "").
 			WillReturnRows(rows)
+		mock.ExpectCommit()
 
 		result := &PolicyEvaluationResult{
 			Allowed: false,
