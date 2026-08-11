@@ -14,7 +14,9 @@ package adapter
 import (
 	"io"
 	"log"
+	"strconv"
 
+	corev3 "github.com/envoyproxy/go-control-plane/envoy/config/core/v3"
 	ext_proc "github.com/envoyproxy/go-control-plane/envoy/service/ext_proc/v3"
 	typev3 "github.com/envoyproxy/go-control-plane/envoy/type/v3"
 )
@@ -92,13 +94,34 @@ func (s *ExtMcpServer) bodyResponse(d BodyDecision, isRequest bool) *ext_proc.Pr
 	case ActionReplace:
 		log.Printf("mcp-shim: REDACT (%s) decision=%s", phase(isRequest), d.DecisionID)
 		cr := &ext_proc.CommonResponse{
-			Status:       ext_proc.CommonResponse_CONTINUE_AND_REPLACE,
-			BodyMutation: &ext_proc.BodyMutation{Mutation: &ext_proc.BodyMutation_Body{Body: d.NewBody}},
+			Status:         ext_proc.CommonResponse_CONTINUE_AND_REPLACE,
+			BodyMutation:   &ext_proc.BodyMutation{Mutation: &ext_proc.BodyMutation_Body{Body: d.NewBody}},
+			HeaderMutation: contentLengthMutation(isRequest, len(d.NewBody)),
 		}
 		return bodyReply(cr, isRequest)
 	default:
 		return bodyReply(&ext_proc.CommonResponse{Status: ext_proc.CommonResponse_CONTINUE}, isRequest)
 	}
+}
+
+// contentLengthMutation keeps the content-length header consistent with a
+// replaced body — the gateway validates the (post-mutation) header against
+// the mutated body length and 500s the call on a mismatch. Requests get the
+// exact new length; responses just drop the header (agentgateway's MCP
+// responses are SSE/chunked, so it is normally absent anyway, and re-framing
+// is the proxy's job).
+func contentLengthMutation(isRequest bool, newLen int) *ext_proc.HeaderMutation {
+	if isRequest {
+		return &ext_proc.HeaderMutation{
+			SetHeaders: []*corev3.HeaderValueOption{{
+				Header: &corev3.HeaderValue{
+					Key:      "content-length",
+					RawValue: []byte(strconv.Itoa(newLen)),
+				},
+			}},
+		}
+	}
+	return &ext_proc.HeaderMutation{RemoveHeaders: []string{"content-length"}}
 }
 
 func bodyReply(cr *ext_proc.CommonResponse, isRequest bool) *ext_proc.ProcessingResponse {
