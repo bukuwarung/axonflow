@@ -160,7 +160,10 @@ type TierLimits struct {
 // Default tier limits
 var (
 	CommunityLimits = TierLimits{
-		TenantPolicies:         20,
+		// BukuWarung fork (AID-212): mirrors the MaxTenantPoliciesCommunity
+		// raise in agent/static_policy_repository.go (20 → 200) so reported
+		// limits match enforced behavior.
+		TenantPolicies:         200,
 		OrgPolicies:            0,
 		CustomPolicyConnectors: 2,
 		AuditRetentionDays:     3,
