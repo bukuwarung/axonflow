@@ -83,10 +83,20 @@ func GovernRequestBody(ctx context.Context, mcp *MCPClient, body []byte) BodyDec
 	return BodyDecision{Action: ActionReplace, NewBody: nb, DecisionID: v.DecisionID}
 }
 
-// GovernResponseBody governs an MCP tool result. Text is pulled from the MCP
-// content blocks (result.content[].text) when present, else the whole result;
-// check-output decides block vs redact.
+// GovernResponseBody governs an MCP tool result. agentgateway (v1.3.x) frames
+// POST /mcp responses as SSE ("data: <json-rpc>" events), so SSE bodies are
+// unwrapped per event; bare JSON bodies are governed directly. Text is pulled
+// from the MCP content blocks (result.content[].text) when present, else the
+// whole result; check-output decides block vs redact.
 func GovernResponseBody(ctx context.Context, mcp *MCPClient, tool string, body []byte) BodyDecision {
+	if looksLikeSSE(body) {
+		return governSSEResponse(ctx, mcp, tool, body)
+	}
+	return governJSONResponse(ctx, mcp, tool, body)
+}
+
+// governJSONResponse governs a single bare JSON-RPC response body.
+func governJSONResponse(ctx context.Context, mcp *MCPClient, tool string, body []byte) BodyDecision {
 	var env jsonrpc
 	if json.Unmarshal(body, &env) != nil || len(env.Result) == 0 {
 		return BodyDecision{Action: ActionPass}
