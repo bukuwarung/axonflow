@@ -24,7 +24,12 @@ import (
 const (
 	// MaxTenantPoliciesCommunity is the maximum number of custom tenant policies
 	// allowed in Community edition.
-	MaxTenantPoliciesCommunity = 20
+	// BukuWarung fork (AID-212): raised 20 → 200 for our self-hosted internal
+	// deployment — staging carries 31 tenant-tier policies (measured 2026-08-11),
+	// which exceeds the upstream default. Internal-use modification permitted by
+	// BSL 1.1; no licence-gated code path is affected (this constant only bounds
+	// the create path in this repository's Community source).
+	MaxTenantPoliciesCommunity = 200
 
 	// MaxVersionHistoryCommunity is the maximum number of version history entries
 	// returned in Community edition.
