@@ -26,7 +26,43 @@ type DecideRequest struct {
 	Query          string         `json:"query"`
 	UserToken      string         `json:"user_token,omitempty"`
 	Context        map[string]any `json:"context,omitempty"`
+
+	// FulfillmentCapabilities advertises what the CALLING SEAM can discharge, so
+	// the PDP emits only obligations this adapter can actually carry out
+	// (seam_capability_decisioning, platform >= 9.11.0).
+	//
+	// Omitting it — or sending an empty slice, which is indistinguishable on the
+	// wire because the field is omitempty — marks a LEGACY caller: the PDP emits
+	// obligations blind to the seam, so a request-phase redact_pii obligation
+	// reaches a seam that cannot rewrite a body and the adapter has to fail
+	// closed. That was this adapter's behavior until AID-100, and it turned every
+	// PII-bearing prompt on the LLM plane into a 403.
+	//
+	// NEVER advertise a capability the seam cannot actually perform.
+	// Under-advertising is safe (we lose an obligation we could have fulfilled and
+	// the org's obligation-fallback posture decides the outcome);
+	// over-advertising forwards unredacted content.
+	FulfillmentCapabilities []string `json:"fulfillment_capabilities,omitempty"`
 }
+
+// Fulfillment capabilities a seam may advertise on
+// DecideRequest.FulfillmentCapabilities. The vocabulary mirrors the platform's
+// shared/pep package — keep the two in lockstep. The PDP lowercases and trims
+// what it receives and ignores tokens it does not know, so an older platform
+// meeting a newer vocabulary degrades instead of failing.
+const (
+	// CapabilityRequestBodyRedaction means the seam can replace the request
+	// payload it is about to forward with engine-redacted content. TRUE for
+	// ext_proc and the ExtMcp shim; FALSE for ext_authz — do not advertise it
+	// from this adapter.
+	CapabilityRequestBodyRedaction = "request_body_redaction"
+
+	// CapabilityRequestHeaderMutation means the seam can add or overwrite request
+	// headers before forwarding. TRUE for ext_authz: its OkHttpResponse carries
+	// header mutations. Advertising it is what makes this adapter a
+	// capability-AWARE caller with a truthful, non-empty set.
+	CapabilityRequestHeaderMutation = "request_header_mutation"
+)
 
 type CallerIdentity struct {
 	GatewayID string `json:"gateway_id,omitempty"`

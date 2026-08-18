@@ -136,3 +136,119 @@ func TestCheck_TransportErrorRespectsFailMode(t *testing.T) {
 		t.Fatalf("expected OK on fail-open transport error, got code=%d", resp2.Status.Code)
 	}
 }
+
+// stubPDPRecording answers every /api/v1/decide with resp and records the last
+// decode of the request body, so a test can assert on what the adapter SENT.
+func stubPDPRecording(t *testing.T, resp DecideResponse, got *DecideRequest) *httptest.Server {
+	t.Helper()
+	return httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if !strings.HasSuffix(r.URL.Path, "/api/v1/decide") {
+			http.NotFound(w, r)
+			return
+		}
+		if err := json.NewDecoder(r.Body).Decode(got); err != nil {
+			t.Errorf("decode decide request: %v", err)
+		}
+		_ = json.NewEncoder(w).Encode(resp)
+	}))
+}
+
+func requestRedactionObligation() Obligation {
+	return Obligation{
+		Type: "redact_pii",
+		Fulfillment: &ObligationFulfillment{
+			Endpoint:     "/api/v1/mcp/check-input",
+			Method:       "POST",
+			Phase:        "request",
+			ContentTypes: []string{"text/plain"},
+		},
+	}
+}
+
+// The whole point of AID-100's seam-capability fix: the adapter must tell the
+// PDP that its seam is headers-only, so the PDP suppresses a request-body
+// redaction obligation and applies the org's fallback posture instead of handing
+// this adapter an obligation it can only fail closed on.
+func TestCheck_AdvertisesHeaderMutationCapabilityOnly(t *testing.T) {
+	var sent DecideRequest
+	pdp := stubPDPRecording(t, DecideResponse{
+		Verdict:    "allow",
+		DecisionID: "test-decision-42",
+	}, &sent)
+	defer pdp.Close()
+	srv := newAuthz(t, pdp.URL, "closed")
+
+	if _, err := srv.Check(context.Background(), newCheckRequest(`{"model":"gpt-4o","messages":[]}`)); err != nil {
+		t.Fatalf("Check returned error: %v", err)
+	}
+
+	if len(sent.FulfillmentCapabilities) != 1 ||
+		sent.FulfillmentCapabilities[0] != CapabilityRequestHeaderMutation {
+		t.Fatalf("expected exactly [%s], got %v",
+			CapabilityRequestHeaderMutation, sent.FulfillmentCapabilities)
+	}
+	// Over-advertising is the dangerous direction: ext_authz cannot rewrite a
+	// body, so claiming it would forward unredacted content.
+	for _, c := range sent.FulfillmentCapabilities {
+		if c == CapabilityRequestBodyRedaction {
+			t.Fatalf("ext_authz must never advertise %s", CapabilityRequestBodyRedaction)
+		}
+	}
+}
+
+// Backstop for a pre-9.11.0 PDP that ignores advertised capabilities: an
+// obligation this seam cannot discharge must still fail closed, never forward.
+func TestCheck_RequestPhaseRedactionObligationFailsClosed(t *testing.T) {
+	var sent DecideRequest
+	pdp := stubPDPRecording(t, DecideResponse{
+		Verdict:     "allow",
+		DecisionID:  "test-decision-42",
+		TraceID:     "0af7651916cd43dd8448eb211c80319c",
+		Obligations: []Obligation{requestRedactionObligation()},
+	}, &sent)
+	defer pdp.Close()
+	srv := newAuthz(t, pdp.URL, "closed")
+
+	resp, err := srv.Check(context.Background(), newCheckRequest(`{"model":"gpt-4o","messages":[]}`))
+	if err != nil {
+		t.Fatalf("Check returned error: %v", err)
+	}
+	denied := resp.GetDeniedResponse()
+	if denied == nil {
+		t.Fatalf("expected DeniedResponse, got %T", resp.HttpResponse)
+	}
+	if denied.Status.Code != 403 {
+		t.Fatalf("expected HTTP 403, got %d", denied.Status.Code)
+	}
+	if !strings.Contains(denied.Body, "seam-capability decisioning") {
+		t.Fatalf("deny body should name the platform-version remedy, got %q", denied.Body)
+	}
+}
+
+// A response-phase obligation is not this seam's work and must not deny: only a
+// request-phase one needs a body rewrite.
+func TestCheck_ResponsePhaseObligationIsAllowed(t *testing.T) {
+	var sent DecideRequest
+	pdp := stubPDPRecording(t, DecideResponse{
+		Verdict:    "allow",
+		DecisionID: "test-decision-42",
+		Obligations: []Obligation{{
+			Type: "redact_pii",
+			Fulfillment: &ObligationFulfillment{
+				Endpoint: "/api/v1/mcp/check-output",
+				Method:   "POST",
+				Phase:    "response",
+			},
+		}},
+	}, &sent)
+	defer pdp.Close()
+	srv := newAuthz(t, pdp.URL, "closed")
+
+	resp, err := srv.Check(context.Background(), newCheckRequest(`{"model":"gpt-4o","messages":[]}`))
+	if err != nil {
+		t.Fatalf("Check returned error: %v", err)
+	}
+	if resp.Status.Code != int32(codes.OK) {
+		t.Fatalf("expected OK, got code=%d body=%q", resp.Status.Code, resp.Status.Message)
+	}
+}
