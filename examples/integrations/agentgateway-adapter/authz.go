@@ -26,12 +26,21 @@ import (
 //	PDP 4xx         → Denied 502 (never fail-open eligible)
 //	unknown verdict → fail-mode logic
 //
-// The response-plane ext_proc seam and request-phase redact_pii obligation
-// FULFILMENT (rewriting the body via /api/v1/mcp/check-input) are out of
-// scope for the ext_authz-only hook — ext_authz can add/remove headers but
-// cannot rewrite the request body. If a decide response carries a
-// request-phase redact_pii obligation, the adapter fails closed rather than
-// forward unredacted content (contract discipline from ADR-056).
+// ext_authz can add or remove headers but cannot rewrite the request body, so
+// the adapter advertises exactly that capability on the decide call
+// (fulfillment_capabilities: request_header_mutation). A platform running
+// seam_capability_decisioning (>= 9.11.0) therefore never offers this seam a
+// request-phase redact_pii obligation: it suppresses the obligation server-side
+// and applies the ORG's obligation-fallback posture — log (allow, with the
+// suppressed redaction and detected categories on the canonical audit row) or
+// block (deny). Every outcome stays an engine decision instead of a verdict the
+// PEP rewrote locally, which is the contract discipline ADR-056 asks for.
+//
+// The obligation backstop below remains for an OLDER PDP that ignores advertised
+// capabilities: forwarding content a policy asked to mask is never an option, so
+// an obligation this seam cannot discharge still fails closed. Obligation
+// FULFILMENT itself (rewriting the body via /api/v1/mcp/check-input) needs the
+// ext_proc seam and is out of scope for this hook.
 type AuthzServer struct {
 	authv3.UnimplementedAuthorizationServer
 	cfg Config
@@ -71,6 +80,10 @@ func (s *AuthzServer) Check(ctx context.Context, req *authv3.CheckRequest) (*aut
 		},
 		Query:     body,
 		UserToken: stripBearer(authHeader),
+		// Truthful for ext_authz: headers yes, request body no. A non-empty set
+		// is what makes this a capability-aware caller — an empty one reads as
+		// "legacy" on the wire and brings back the undischargeable obligation.
+		FulfillmentCapabilities: []string{CapabilityRequestHeaderMutation},
 	}
 
 	resp, err := s.pdp.Decide(ctx, decideReq, traceparent)
@@ -87,12 +100,16 @@ func (s *AuthzServer) Check(ctx context.Context, req *authv3.CheckRequest) (*aut
 			"AxonFlow PDP unreachable and fail-mode is closed", "", ""), nil
 	}
 
-	// A request-phase redact_pii obligation cannot be discharged via
-	// ext_authz (body rewrites need ext_proc). Fail closed rather than
-	// forward unredacted content.
+	// Backstop only: a capability-aware decide call should never come back with a
+	// request-phase redact_pii obligation (see the type comment — the PDP
+	// suppresses it and applies the org's fallback posture instead). If one still
+	// arrives, the platform predates seam_capability_decisioning; fail closed
+	// rather than forward content a policy asked to mask.
 	if hasRequestRedaction(resp.Obligations) {
 		return denied(codes.PermissionDenied, 403,
-			"request-phase redact_pii obligation cannot be discharged via ext_authz — enable ext_proc",
+			"request-phase redact_pii obligation cannot be discharged via ext_authz: "+
+				"upgrade the AxonFlow platform to >=9.11.0 for seam-capability decisioning, "+
+				"or move this listener to the ext_proc seam",
 			resp.DecisionID, resp.TraceID), nil
 	}
 
