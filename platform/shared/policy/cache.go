@@ -86,6 +86,34 @@ func (c *PolicyCache) Get(tenantID string, orgID *string, phase Phase) ([]Compil
 	}
 }
 
+// GetStale returns cached policies for a tenant/phase IGNORING expiry. It is the
+// availability fallback (dead-air fix): when a policy refresh fails, the
+// last-known-good set is served so governance continues to enforce REAL policies
+// (slightly stale) rather than the engine failing closed and blocking the
+// request/response with no content for the end user. found is false only when
+// nothing was ever cached for this tenant (cold start), in which case the caller
+// still fails closed. Reads do not extend the entry's expiry — a healthy refresh
+// replaces it via Set as normal.
+func (c *PolicyCache) GetStale(tenantID string, orgID *string, phase Phase) ([]CompiledPolicy, bool) {
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+
+	cached, exists := c.tenantCache[c.cacheKey(tenantID, orgID)]
+	if !exists {
+		return nil, false
+	}
+	switch phase {
+	case PhaseRequest:
+		return cached.requestPolicies, true
+	case PhaseResponse:
+		return cached.responsePolicies, true
+	case PhaseBoth:
+		return c.mergePolicies(cached.requestPolicies, cached.responsePolicies), true
+	default:
+		return nil, false
+	}
+}
+
 // Set stores policies for a tenant in the cache.
 // Policies are automatically separated by phase.
 func (c *PolicyCache) Set(tenantID string, orgID *string, policies []CompiledPolicy) {

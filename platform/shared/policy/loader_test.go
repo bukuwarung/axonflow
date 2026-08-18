@@ -36,10 +36,32 @@ func TestPolicyLoader_GetPolicies_CacheMiss_NoDB(t *testing.T) {
 	cache := NewPolicyCache(5*time.Minute, 100)
 	loader := NewPolicyLoader(nil, cache)
 
-	// No cache, no DB - should error
+	// No cache, no DB - should error (cold start with the store unreachable is
+	// genuinely unscannable, so the engine still fails closed).
 	_, err := loader.GetPolicies(context.Background(), "tenant1", nil, PhaseRequest)
 	if err == nil {
 		t.Error("Expected error when cache miss and no DB")
+	}
+}
+
+func TestPolicyLoader_GetPolicies_ServesStaleOnLoadFailure(t *testing.T) {
+	// Dead-air fix: a refresh failure after TTL expiry must serve the
+	// last-known-good set instead of erroring (which made the engine fail closed
+	// and block the request/response with no content for the end user).
+	cache := NewPolicyCache(10*time.Millisecond, 100)
+	loader := NewPolicyLoader(nil, cache) // nil DB => loadFromDatabase always fails
+
+	cache.Set("tenant1", nil, []CompiledPolicy{
+		{PolicyID: "p1", Phase: PhaseRequest, Enabled: true},
+	})
+	time.Sleep(30 * time.Millisecond) // let the fresh entry expire
+
+	result, err := loader.GetPolicies(context.Background(), "tenant1", nil, PhaseRequest)
+	if err != nil {
+		t.Fatalf("expected stale-serve without error on load failure, got: %v", err)
+	}
+	if len(result) != 1 || result[0].PolicyID != "p1" {
+		t.Fatalf("expected the stale cached policy p1, got %+v", result)
 	}
 }
 

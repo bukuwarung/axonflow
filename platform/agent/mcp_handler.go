@@ -1222,7 +1222,7 @@ func evaluateOutputPolicies(
 			out.StaticResult = &sharedpolicy.ResponseResult{
 				Blocked:         true,
 				EvaluationError: true,
-				BlockReason:     "response withheld: policy engine could not evaluate (fail-closed)",
+				BlockReason:     "response withheld: safety check could not run and no cached ruleset was available (policy store unreachable). The response was not lost — retry shortly; if this persists, contact your AxonFlow administrator.",
 			}
 			return out
 		}
@@ -1415,7 +1415,7 @@ func evaluateOutputPolicies(
 				log.Printf("[MCP] Response withheld: response-phase scan could not complete (fail-closed, #2820)")
 				out.StaticResult.Blocked = true
 				if out.StaticResult.BlockReason == "" {
-					out.StaticResult.BlockReason = "response withheld: policy engine could not evaluate (fail-closed)"
+					out.StaticResult.BlockReason = "response withheld: safety check could not run and no cached ruleset was available (policy store unreachable). The response was not lost — retry shortly; if this persists, contact your AxonFlow administrator."
 				}
 				return out
 			}

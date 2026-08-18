@@ -124,7 +124,7 @@ func (e *UnifiedPolicyEngine) EvaluateRequest(ctx context.Context, input string,
 		// distinct from a policy verdict, so callers can audit it as such.
 		result.EvaluationError = true
 		result.Blocked = true
-		result.BlockReason = "Policy engine unavailable"
+		result.BlockReason = "Safety check temporarily unavailable — the policy service is starting up and no cached ruleset is loaded yet. Your request was not lost; retry in a few seconds. If this persists, contact your AxonFlow administrator (policy store unreachable)."
 		result.ProcessingTimeMs = time.Since(startTime).Milliseconds()
 		log.Printf("[PolicyEngine] Failed to load policies, blocking request (fail-closed): %v", err)
 		return result
@@ -292,7 +292,7 @@ func (e *UnifiedPolicyEngine) EvaluateResponse(ctx context.Context, content inte
 			return result
 		}
 		result.Blocked = true
-		result.BlockReason = "Policy engine unavailable"
+		result.BlockReason = "Safety check temporarily unavailable — the policy service is starting up and no cached ruleset is loaded yet. Your request was not lost; retry in a few seconds. If this persists, contact your AxonFlow administrator (policy store unreachable)."
 		result.ProcessingTimeMs = time.Since(startTime).Milliseconds()
 		return result
 	}

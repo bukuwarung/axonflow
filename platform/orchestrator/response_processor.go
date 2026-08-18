@@ -296,7 +296,7 @@ func (p *ResponseProcessor) processWithSharedEngine(ctx context.Context, user Us
 		log.Printf("[ResponseProcessor] Response withheld: could not load response-phase policies (fail-closed, #2820): %v", err)
 		return data, &RedactionInfo{
 			Verdict:         responseVerdictBlocked,
-			ValidationError: "response withheld: policy engine could not evaluate (fail-closed)",
+			ValidationError: "response withheld: safety check could not run and no cached ruleset was available (policy store unreachable). The response was not lost — retry shortly; if this persists, contact your AxonFlow administrator.",
 		}
 	}
 
@@ -335,7 +335,7 @@ func (p *ResponseProcessor) processWithSharedEngine(ctx context.Context, user Us
 		log.Printf("[ResponseProcessor] Response withheld: response-phase scan could not complete (fail-closed, #2820)")
 		return data, &RedactionInfo{
 			Verdict:         responseVerdictBlocked,
-			ValidationError: "response withheld: policy engine could not evaluate (fail-closed)",
+			ValidationError: "response withheld: safety check could not run and no cached ruleset was available (policy store unreachable). The response was not lost — retry shortly; if this persists, contact your AxonFlow administrator.",
 		}
 	}
 

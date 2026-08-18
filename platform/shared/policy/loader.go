@@ -107,6 +107,19 @@ func (l *PolicyLoader) GetPolicies(ctx context.Context, tenantID string, orgID *
 	// Load from database
 	policies, err := l.loadFromDatabase(ctx, tenantID, orgID)
 	if err != nil {
+		// Availability fallback (dead-air fix): a failed refresh must NOT drop the
+		// engine to fail-closed when a last-known-good set exists. Failing closed
+		// here blocked the request/response and returned no content to the end user
+		// ("Policy engine unavailable" / "response withheld") on nothing more than a
+		// transient DB blip after the TTL expired — the dominant cause of user-facing
+		// blocks. Serve the stale cached set instead: governance keeps enforcing REAL
+		// (slightly old) policies, and the next successful load refreshes it. We only
+		// surface the error — and let the engine fail closed — when there is NO cached
+		// set at all (cold start with the DB down), which is genuinely unscannable.
+		if stale, ok := l.cache.GetStale(tenantID, orgID, phase); ok {
+			log.Printf("[PolicyLoader] policy refresh failed for tenant=%s; serving last-known-good cached policies (stale) to avoid failing closed: %v", tenantID, err)
+			return stale, nil
+		}
 		return nil, fmt.Errorf("failed to load policies: %w", err)
 	}
 
