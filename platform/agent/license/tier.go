@@ -192,9 +192,12 @@ var (
 		// list_recent_decisions tool is unusable at a 5-row page.
 		DecisionListWindowHours: 336,
 		DecisionListMaxPage:     100,
-		// BukuWarung fork (AID-212): HITL approvals enabled (was
-		// Evaluation+); expiry mirrors Evaluation's 24h. Approval surface
-		// is the HITL API — the Enterprise portal is not deployed.
+		// BukuWarung fork (AID-212): flag flipped, but INERT on community
+		// builds — platform/agent/hitl/ ships only the !enterprise stub,
+		// whose CreateApprovalRequest unconditionally returns
+		// ErrHITLApprovalDisabledByTier. Enabling HITL on Community means
+		// implementing the queue (fork feature work), not lifting a cap.
+		// Kept true so a future port reads the right limits.
 		HITLApprovalEnabled:      true,
 		HITLExpiryHours:          24,
 		PolicySimulationEnabled:  false,
