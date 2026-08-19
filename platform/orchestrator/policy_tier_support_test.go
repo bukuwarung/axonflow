@@ -27,8 +27,8 @@ func TestDefaultLicenseChecker(t *testing.T) {
 	if limit := checker.CustomPolicyConnectorLimit(); limit != license.CommunityLimits.CustomPolicyConnectors {
 		t.Errorf("DefaultLicenseChecker.CustomPolicyConnectorLimit() = %d, want %d", limit, license.CommunityLimits.CustomPolicyConnectors)
 	}
-	if days := checker.AuditRetentionDays(); days != 3 {
-		t.Errorf("DefaultLicenseChecker.AuditRetentionDays() = %d, want 3", days)
+	if days := checker.AuditRetentionDays(); days != 400 {
+		t.Errorf("DefaultLicenseChecker.AuditRetentionDays() = %d, want 400", days)
 	}
 	if v := checker.MaxLLMProviders(); v != 2 {
 		t.Errorf("DefaultLicenseChecker.MaxLLMProviders() = %d, want 2", v)
@@ -48,21 +48,21 @@ func TestDefaultLicenseChecker(t *testing.T) {
 	if v := checker.MaxSSEConnections(); v != 5 {
 		t.Errorf("DefaultLicenseChecker.MaxSSEConnections() = %d, want 5", v)
 	}
-	if v := checker.MaxCostEstimatesPerDay(); v != 10 {
-		t.Errorf("DefaultLicenseChecker.MaxCostEstimatesPerDay() = %d, want 10", v)
+	if v := checker.MaxCostEstimatesPerDay(); v != -1 {
+		t.Errorf("DefaultLicenseChecker.MaxCostEstimatesPerDay() = %d, want -1", v)
 	}
-	if v := checker.MaxPendingApprovals(); v != 5 {
-		t.Errorf("DefaultLicenseChecker.MaxPendingApprovals() = %d, want 5", v)
+	if v := checker.MaxPendingApprovals(); v != 100 {
+		t.Errorf("DefaultLicenseChecker.MaxPendingApprovals() = %d, want 100", v)
 	}
 	if v := checker.MediaGovernanceEnabled(); v != false {
 		t.Errorf("DefaultLicenseChecker.MediaGovernanceEnabled() = %v, want false", v)
 	}
 	// Evaluation-tier feature methods should return Community defaults
-	if v := checker.IsHITLApprovalEnabled(); v != false {
-		t.Errorf("DefaultLicenseChecker.IsHITLApprovalEnabled() = %v, want false", v)
+	if v := checker.IsHITLApprovalEnabled(); v != true {
+		t.Errorf("DefaultLicenseChecker.IsHITLApprovalEnabled() = %v, want true", v)
 	}
-	if v := checker.HITLExpiryHours(); v != 0 {
-		t.Errorf("DefaultLicenseChecker.HITLExpiryHours() = %d, want 0", v)
+	if v := checker.HITLExpiryHours(); v != 24 {
+		t.Errorf("DefaultLicenseChecker.HITLExpiryHours() = %d, want 24", v)
 	}
 	if v := checker.IsPolicySimulationEnabled(); v != false {
 		t.Errorf("DefaultLicenseChecker.IsPolicySimulationEnabled() = %v, want false", v)
@@ -99,8 +99,8 @@ func TestEnvLicenseChecker_Community(t *testing.T) {
 	if tier := checker.Tier(); tier != license.TierCommunity {
 		t.Errorf("EnvLicenseChecker.Tier() = %q, want %q", tier, license.TierCommunity)
 	}
-	if limit := checker.PolicyLimit(); limit != 20 {
-		t.Errorf("EnvLicenseChecker.PolicyLimit() = %d, want 20", limit)
+	if limit := checker.PolicyLimit(); limit != 200 {
+		t.Errorf("EnvLicenseChecker.PolicyLimit() = %d, want 200", limit)
 	}
 	if limit := checker.OrgPolicyLimit(); limit != 0 {
 		t.Errorf("EnvLicenseChecker.OrgPolicyLimit() = %d, want 0", limit)
@@ -108,8 +108,8 @@ func TestEnvLicenseChecker_Community(t *testing.T) {
 	if limit := checker.CustomPolicyConnectorLimit(); limit != 2 {
 		t.Errorf("EnvLicenseChecker.CustomPolicyConnectorLimit() = %d, want 2", limit)
 	}
-	if days := checker.AuditRetentionDays(); days != 3 {
-		t.Errorf("EnvLicenseChecker.AuditRetentionDays() = %d, want 3", days)
+	if days := checker.AuditRetentionDays(); days != 400 {
+		t.Errorf("EnvLicenseChecker.AuditRetentionDays() = %d, want 400", days)
 	}
 	if v := checker.MaxLLMProviders(); v != 2 {
 		t.Errorf("EnvLicenseChecker.MaxLLMProviders() = %d, want 2", v)
@@ -129,21 +129,21 @@ func TestEnvLicenseChecker_Community(t *testing.T) {
 	if v := checker.MaxSSEConnections(); v != 5 {
 		t.Errorf("EnvLicenseChecker.MaxSSEConnections() = %d, want 5", v)
 	}
-	if v := checker.MaxCostEstimatesPerDay(); v != 10 {
-		t.Errorf("EnvLicenseChecker.MaxCostEstimatesPerDay() = %d, want 10", v)
+	if v := checker.MaxCostEstimatesPerDay(); v != -1 {
+		t.Errorf("EnvLicenseChecker.MaxCostEstimatesPerDay() = %d, want -1", v)
 	}
-	if v := checker.MaxPendingApprovals(); v != 5 {
-		t.Errorf("EnvLicenseChecker.MaxPendingApprovals() = %d, want 5", v)
+	if v := checker.MaxPendingApprovals(); v != 100 {
+		t.Errorf("EnvLicenseChecker.MaxPendingApprovals() = %d, want 100", v)
 	}
 	if v := checker.MediaGovernanceEnabled(); v != false {
 		t.Errorf("EnvLicenseChecker.MediaGovernanceEnabled() = %v, want false", v)
 	}
 	// Evaluation-tier feature methods should return Community defaults without a license
-	if v := checker.IsHITLApprovalEnabled(); v != false {
-		t.Errorf("EnvLicenseChecker.IsHITLApprovalEnabled() = %v, want false", v)
+	if v := checker.IsHITLApprovalEnabled(); v != true {
+		t.Errorf("EnvLicenseChecker.IsHITLApprovalEnabled() = %v, want true", v)
 	}
-	if v := checker.HITLExpiryHours(); v != 0 {
-		t.Errorf("EnvLicenseChecker.HITLExpiryHours() = %d, want 0", v)
+	if v := checker.HITLExpiryHours(); v != 24 {
+		t.Errorf("EnvLicenseChecker.HITLExpiryHours() = %d, want 24", v)
 	}
 	if v := checker.IsPolicySimulationEnabled(); v != false {
 		t.Errorf("EnvLicenseChecker.IsPolicySimulationEnabled() = %v, want false", v)

@@ -243,8 +243,10 @@ func TestTierLimits(t *testing.T) {
 	if CommunityLimits.CustomPolicyConnectors != 2 {
 		t.Errorf("CommunityLimits.CustomPolicyConnectors = %d, want 2", CommunityLimits.CustomPolicyConnectors)
 	}
-	if CommunityLimits.AuditRetentionDays != 3 {
-		t.Errorf("CommunityLimits.AuditRetentionDays = %d, want 3", CommunityLimits.AuditRetentionDays)
+	// BukuWarung fork (AID-212): retention raised 3 → 400 to match the
+	// DIY audit plane.
+	if CommunityLimits.AuditRetentionDays != 400 {
+		t.Errorf("CommunityLimits.AuditRetentionDays = %d, want 400", CommunityLimits.AuditRetentionDays)
 	}
 
 	if EvaluationLimits.TenantPolicies != 50 {

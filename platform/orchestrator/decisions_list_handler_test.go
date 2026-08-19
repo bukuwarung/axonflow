@@ -170,7 +170,9 @@ func TestListDecisions_TierMatrix(t *testing.T) {
 		wantWindowH int
 		wantMaxPage int
 	}{
-		{"Community 24h/5", license.TierCommunity, 24, 5},
+		// BukuWarung fork (AID-212): Community raised to Evaluation's
+		// decision-list values (14d/100).
+		{"Community 14d/100", license.TierCommunity, 336, 100},
 		{"Evaluation 14d/100", license.TierEvaluation, 336, 100},
 		{"Enterprise full/1000", license.TierEnterprise, -1, 1000},
 	}
@@ -196,7 +198,9 @@ func TestListDecisions_TierMatrix(t *testing.T) {
 // =============================================================================
 
 func TestListDecisions_CommunityCapHit429(t *testing.T) {
-	req := httptest.NewRequest(http.MethodGet, "/api/v1/decisions?limit=10", nil)
+	// BukuWarung fork (AID-212): Community max page is now 100, so the
+	// over-cap request must exceed that.
+	req := httptest.NewRequest(http.MethodGet, "/api/v1/decisions?limit=200", nil)
 	req.Header.Set("X-Tenant-ID", "tenant-a")
 	// No X-Axonflow-Effective-Tier header → falls back to the deployment
 	// tier (Community in this test binary, since tierChecker is nil).
@@ -226,8 +230,8 @@ func TestListDecisions_CommunityCapHit429(t *testing.T) {
 		t.Errorf("envelope.limit_type: got %q, want %q",
 			env.LimitType, limitTypeDecisionListSize)
 	}
-	if env.Limit != 5 {
-		t.Errorf("envelope.limit: got %d, want 5 (Community max page)", env.Limit)
+	if env.Limit != 100 {
+		t.Errorf("envelope.limit: got %d, want 100 (Community max page)", env.Limit)
 	}
 	if env.Upgrade.Tier != "Pro" {
 		t.Errorf("envelope.upgrade.tier: got %q, want Pro", env.Upgrade.Tier)

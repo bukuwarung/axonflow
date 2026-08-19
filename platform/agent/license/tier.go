@@ -166,27 +166,37 @@ var (
 		TenantPolicies:         200,
 		OrgPolicies:            0,
 		CustomPolicyConnectors: 2,
-		AuditRetentionDays:     3,
+		// BukuWarung fork (AID-212): raised 3 → 400 to match the DIY audit
+		// plane's retention so the product layer doesn't prune rows the
+		// compliance store is still meant to hold.
+		AuditRetentionDays:     400,
 		MaxLLMProviders:        2,
 		MaxExecutionHistory:    50,
 		MaxConcurrentExec:      5,
 		MaxPlans:               25,
 		MaxVersionsPerPlan:     10,
 		MaxSSEConnections:      5,
-		MaxCostEstimatesPerDay: 10,
-		MaxPendingApprovals:    5,
+		// BukuWarung fork (AID-212): 10 → -1 (unlimited) and 5 → 100 —
+		// internal single-tenant deployment; the SaaS-freemium caps serve
+		// no purpose here and starve MCP-driven workflows.
+		MaxCostEstimatesPerDay: -1,
+		MaxPendingApprovals:    100,
 		MediaGovernanceEnabled: false, // Opt-in via MEDIA_GOVERNANCE_ENABLED=true
 		DailyEventQuota:        -1,    // not a SaaS Plugin tier; daily quota n/a
 		// V1 Plugin Pro fields: -1 = n/a (community build never resolves
 		// to a SaaS Plugin tier; cross-build struct-shape parity only).
 		MaxActiveCustomPolicies: -1,
 		MaxHITLApprovalsPerWeek: -1,
-		// V1.1 decision-list: 24h / 5 per page (matches SaaS Free).
-		DecisionListWindowHours: 24,
-		DecisionListMaxPage:     5,
-		// Evaluation features disabled
-		HITLApprovalEnabled:      false,
-		HITLExpiryHours:          0,
+		// BukuWarung fork (AID-212): decision-list raised from SaaS-Free
+		// values (24h/5) to Evaluation values (14d/100) — the plugin's
+		// list_recent_decisions tool is unusable at a 5-row page.
+		DecisionListWindowHours: 336,
+		DecisionListMaxPage:     100,
+		// BukuWarung fork (AID-212): HITL approvals enabled (was
+		// Evaluation+); expiry mirrors Evaluation's 24h. Approval surface
+		// is the HITL API — the Enterprise portal is not deployed.
+		HITLApprovalEnabled:      true,
+		HITLExpiryHours:          24,
 		PolicySimulationEnabled:  false,
 		MaxSimulationsPerDay:     0,
 		MaxImpactReportInputs:    0,
