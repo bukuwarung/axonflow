@@ -178,9 +178,9 @@ func (cr *chatRequest) rewrite(masked []string) ([]byte, bool) {
 
 // governTexts runs the span texts through check via ONE joined call, falling
 // back to one call per span when the join is not splittable (see chatTextSep).
-// Returns the masked texts (parallel to texts; equal strings when untouched),
-// or a non-nil block decision.
-func governTexts(ctx context.Context, texts []string, check func(context.Context, string) MCPVerdict) ([]string, *BodyDecision) {
+// Returns the masked texts (parallel to texts; equal strings when untouched)
+// plus the decision id for audit correlation, or a non-nil block decision.
+func governTexts(ctx context.Context, texts []string, check func(context.Context, string) MCPVerdict) ([]string, string, *BodyDecision) {
 	joinable := true
 	for _, t := range texts {
 		if strings.Contains(t, "\x1e") {
@@ -191,23 +191,27 @@ func governTexts(ctx context.Context, texts []string, check func(context.Context
 	if joinable && len(texts) > 1 {
 		v := check(ctx, strings.Join(texts, chatTextSep))
 		if !v.Allowed {
-			return nil, &BodyDecision{Action: ActionBlock, Reason: nonEmptyReason(v.Reason, "request blocked by policy"), DecisionID: v.DecisionID}
+			return nil, v.DecisionID, &BodyDecision{Action: ActionBlock, Reason: nonEmptyReason(v.Reason, "request blocked by policy"), DecisionID: v.DecisionID}
 		}
 		if !v.WasRedacted {
-			return texts, nil
+			return texts, v.DecisionID, nil
 		}
 		pieces := strings.Split(v.Redacted, chatTextSep)
 		if len(pieces) == len(texts) {
-			return pieces, nil
+			return pieces, v.DecisionID, nil
 		}
 		// A redaction span straddled a separator — rare, but the per-span
 		// fallback below still governs everything correctly.
 	}
 	out := make([]string, len(texts))
+	lastDecision := ""
 	for i, t := range texts {
 		v := check(ctx, t)
+		if v.DecisionID != "" {
+			lastDecision = v.DecisionID
+		}
 		if !v.Allowed {
-			return nil, &BodyDecision{Action: ActionBlock, Reason: nonEmptyReason(v.Reason, "request blocked by policy"), DecisionID: v.DecisionID}
+			return nil, v.DecisionID, &BodyDecision{Action: ActionBlock, Reason: nonEmptyReason(v.Reason, "request blocked by policy"), DecisionID: v.DecisionID}
 		}
 		if v.WasRedacted {
 			out[i] = v.Redacted
@@ -215,7 +219,7 @@ func governTexts(ctx context.Context, texts []string, check func(context.Context
 			out[i] = t
 		}
 	}
-	return out, nil
+	return out, lastDecision, nil
 }
 
 // GovernLLMRequestBody governs a chat-completions request body. Message text
@@ -231,7 +235,7 @@ func GovernLLMRequestBody(ctx context.Context, mcp *MCPClient, body []byte) Body
 	for i, r := range cr.refs {
 		texts[i] = r.text
 	}
-	masked, blocked := governTexts(ctx, texts, func(ctx context.Context, s string) MCPVerdict {
+	masked, decisionID, blocked := governTexts(ctx, texts, func(ctx context.Context, s string) MCPVerdict {
 		return mcp.CheckInput(ctx, cr.model, s)
 	})
 	if blocked != nil {
@@ -245,14 +249,14 @@ func GovernLLMRequestBody(ctx context.Context, mcp *MCPClient, body []byte) Body
 		}
 	}
 	if !changed {
-		return BodyDecision{Action: ActionPass}
+		return BodyDecision{Action: ActionPass, DecisionID: decisionID}
 	}
 	nb, ok := cr.rewrite(masked)
 	if !ok {
 		// never forward the original once redaction was required — fail closed.
-		return BodyDecision{Action: ActionBlock, Reason: "request redaction rewrite failed (fail closed)"}
+		return BodyDecision{Action: ActionBlock, Reason: "request redaction rewrite failed (fail closed)", DecisionID: decisionID}
 	}
-	return BodyDecision{Action: ActionReplace, NewBody: nb}
+	return BodyDecision{Action: ActionReplace, NewBody: nb, DecisionID: decisionID}
 }
 
 // GovernLLMResponseJSON governs a NON-streaming chat-completions response body
@@ -299,7 +303,7 @@ func GovernLLMResponseJSON(ctx context.Context, mcp *MCPClient, model string, bo
 	for i, r := range refs {
 		texts[i] = r.text
 	}
-	masked, blocked := governTexts(ctx, texts, func(ctx context.Context, s string) MCPVerdict {
+	masked, decisionID, blocked := governTexts(ctx, texts, func(ctx context.Context, s string) MCPVerdict {
 		return mcp.CheckOutput(ctx, model, s)
 	})
 	if blocked != nil {
@@ -313,12 +317,12 @@ func GovernLLMResponseJSON(ctx context.Context, mcp *MCPClient, model string, bo
 		changed = true
 		nb, err := json.Marshal(masked[i])
 		if err != nil {
-			return BodyDecision{Action: ActionBlock, Reason: "response redaction rewrite failed (fail closed)"}
+			return BodyDecision{Action: ActionBlock, Reason: "response redaction rewrite failed (fail closed)", DecisionID: decisionID}
 		}
 		msgs[r.choice]["content"] = nb
 	}
 	if !changed {
-		return BodyDecision{Action: ActionPass}
+		return BodyDecision{Action: ActionPass, DecisionID: decisionID}
 	}
 	for i, msg := range msgs {
 		if msg == nil {
@@ -326,18 +330,18 @@ func GovernLLMResponseJSON(ctx context.Context, mcp *MCPClient, model string, bo
 		}
 		nb, err := json.Marshal(msg)
 		if err != nil {
-			return BodyDecision{Action: ActionBlock, Reason: "response redaction rewrite failed (fail closed)"}
+			return BodyDecision{Action: ActionBlock, Reason: "response redaction rewrite failed (fail closed)", DecisionID: decisionID}
 		}
 		choices[i]["message"] = nb
 	}
 	nb, err := json.Marshal(choices)
 	if err != nil {
-		return BodyDecision{Action: ActionBlock, Reason: "response redaction rewrite failed (fail closed)"}
+		return BodyDecision{Action: ActionBlock, Reason: "response redaction rewrite failed (fail closed)", DecisionID: decisionID}
 	}
 	fields["choices"] = nb
 	out, err := json.Marshal(fields)
 	if err != nil {
-		return BodyDecision{Action: ActionBlock, Reason: "response redaction rewrite failed (fail closed)"}
+		return BodyDecision{Action: ActionBlock, Reason: "response redaction rewrite failed (fail closed)", DecisionID: decisionID}
 	}
-	return BodyDecision{Action: ActionReplace, NewBody: out}
+	return BodyDecision{Action: ActionReplace, NewBody: out, DecisionID: decisionID}
 }
