@@ -48,6 +48,9 @@ const (
 	// CategoryPIIIndonesia covers Indonesia-specific PII patterns.
 	// Includes: NIK, NPWP (legacy 15-digit + new 16-digit), +62 phone, bank accounts (BCA/Mandiri/BRI/BNI).
 	CategoryPIIIndonesia PolicyCategory = "pii-indonesia"
+	// CategoryPIICompensation covers compensation/payroll PII patterns.
+	// Includes: employee IDs (BWID BWnnnnn), labelled salary/bonus amounts.
+	CategoryPIICompensation PolicyCategory = "pii-compensation"
 
 	// Static policy categories - Code Governance (Issue #761)
 	// These categories enable governed code generation by detecting secrets,
@@ -100,8 +103,9 @@ func StaticPolicyCategories() []PolicyCategory {
 		CategoryPIIUS,
 		CategoryPIIEU,
 		CategoryPIIIndia,
-		CategoryPIISingapore, // Issue #1076 - MAS FEAT Community
-		CategoryPIIIndonesia, // OJK/BI/UU PDP compliance
+		CategoryPIISingapore,    // Issue #1076 - MAS FEAT Community
+		CategoryPIIIndonesia,    // OJK/BI/UU PDP compliance
+		CategoryPIICompensation, // compensation/payroll PII (org-tier rows)
 		CategoryCodeSecrets,
 		CategoryCodeUnsafe,
 		CategoryCodeCompliance,

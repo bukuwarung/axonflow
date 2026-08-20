@@ -140,6 +140,11 @@ const (
 	CategoryPIIEU        PolicyCategory = "pii-eu"
 	CategoryPIISingapore PolicyCategory = "pii-singapore" // Issue #1076 - MAS FEAT Community
 	CategoryPIIIndonesia PolicyCategory = "pii-indonesia" // OJK/BI/UU PDP compliance
+	// CategoryPIICompensation covers compensation/payroll data (employee IDs,
+	// labelled salary amounts). No category-default validator on purpose — the
+	// regex match stands alone, like pii-singapore (a checksum default such as
+	// pii-india's Aadhaar would gate matches on a checksum they can never satisfy).
+	CategoryPIICompensation PolicyCategory = "pii-compensation"
 
 	// Data governance categories
 	CategoryDataExfiltration PolicyCategory = "data-exfiltration"
@@ -282,6 +287,7 @@ func AllTextPIICategories() []PolicyCategory {
 		CategoryPIIEU,
 		CategoryPIISingapore,
 		CategoryPIIIndonesia,
+		CategoryPIICompensation,
 	}
 }
 

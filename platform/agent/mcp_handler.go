@@ -940,7 +940,10 @@ func redactInputStatement(ctx context.Context, tenantID, userID, connectorName, 
 			Categories:      piiCats,
 			SkipCategories:  effective.SkipCategories,
 			ActionOverrides: effective.BuildActionOverrides(),
-			MaxRedactions:   100,
+			// 1000, not 100: a payroll-style table carries hundreds of PII spans;
+			// past the cap the engine drops the remaining span plans and the tail
+			// forwards UNMASKED (engine.go MaxRedactions trim — silent, no error).
+			MaxRedactions: 1000,
 		})
 		if result != nil && result.Redacted {
 			if rows, ok := result.Content.([]map[string]interface{}); ok && len(rows) > 0 {
@@ -1405,7 +1408,10 @@ func evaluateOutputPolicies(
 				ToolIdentity:    toolIdentity,
 				SkipCategories:  mcpDetectionCfg.SkipCategories,
 				ActionOverrides: actionOverrides,
-				MaxRedactions:   100,
+				// 1000, not 100: past the cap the engine silently drops the
+				// remaining span plans and the tail forwards unmasked (statement-
+				// removal/injection plans are exempt from the cap either way).
+				MaxRedactions: 1000,
 			})
 			// #2820: second line of defense — a load race between the
 			// PoliciesLoadable gate above and here (cache expiry mid-request)
