@@ -68,6 +68,19 @@ func (s *AuthzServer) Check(ctx context.Context, req *authv3.CheckRequest) (*aut
 		body = body[:s.cfg.MaxBodyBytes]
 	}
 
+	// Truthful for ext_authz alone: headers yes, request body no. A non-empty
+	// set is what makes this a capability-aware caller — an empty one reads as
+	// "legacy" on the wire and brings back the undischargeable obligation.
+	// With CompanionBodyRedaction the SEAM (this adapter + the LLM ext_proc
+	// shim on the same listener) can also rewrite bodies — the shim runs
+	// check-input on every POST body regardless of the verdict here — so
+	// request_body_redaction becomes truthful and the PDP stops suppressing
+	// the redact_pii obligation (AID-100 Fix B capability flip).
+	capabilities := []string{CapabilityRequestHeaderMutation}
+	if s.cfg.CompanionBodyRedaction {
+		capabilities = append(capabilities, CapabilityRequestBodyRedaction)
+	}
+
 	decideReq := DecideRequest{
 		Stage: s.cfg.StageOr("llm"),
 		CallerIdentity: CallerIdentity{
@@ -78,12 +91,9 @@ func (s *AuthzServer) Check(ctx context.Context, req *authv3.CheckRequest) (*aut
 		Target: Target{
 			Type: s.cfg.StageOr("llm"),
 		},
-		Query:     body,
-		UserToken: stripBearer(authHeader),
-		// Truthful for ext_authz: headers yes, request body no. A non-empty set
-		// is what makes this a capability-aware caller — an empty one reads as
-		// "legacy" on the wire and brings back the undischargeable obligation.
-		FulfillmentCapabilities: []string{CapabilityRequestHeaderMutation},
+		Query:                   body,
+		UserToken:               stripBearer(authHeader),
+		FulfillmentCapabilities: capabilities,
 	}
 
 	resp, err := s.pdp.Decide(ctx, decideReq, traceparent)
@@ -105,7 +115,12 @@ func (s *AuthzServer) Check(ctx context.Context, req *authv3.CheckRequest) (*aut
 	// suppresses it and applies the org's fallback posture instead). If one still
 	// arrives, the platform predates seam_capability_decisioning; fail closed
 	// rather than forward content a policy asked to mask.
-	if hasRequestRedaction(resp.Obligations) {
+	//
+	// With CompanionBodyRedaction the obligation IS dischargeable: the LLM
+	// ext_proc shim rewrites every POST body via check-input downstream of this
+	// allow, so we advertise the capability above and treat the obligation as
+	// fulfilled by the companion seam instead of failing closed.
+	if !s.cfg.CompanionBodyRedaction && hasRequestRedaction(resp.Obligations) {
 		return denied(codes.PermissionDenied, 403,
 			"request-phase redact_pii obligation cannot be discharged via ext_authz: "+
 				"upgrade the AxonFlow platform to >=9.11.0 for seam-capability decisioning, "+

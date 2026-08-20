@@ -24,23 +24,43 @@ import (
 
 // MCPClient calls the check-input / check-output planes.
 type MCPClient struct {
-	cfg  Config
-	http *http.Client
+	cfg       Config
+	http      *http.Client
+	connector string // connector_type label on PDP calls; default "mcp"
 }
 
 // NewMCPClient builds an MCP PDP client from the shared adapter Config.
 func NewMCPClient(cfg Config) *MCPClient {
-	return &MCPClient{cfg: cfg, http: &http.Client{Timeout: cfg.RequestTimeout}}
+	return &MCPClient{cfg: cfg, http: &http.Client{Timeout: cfg.RequestTimeout}, connector: "mcp"}
+}
+
+// WithConnector returns a copy labelling its PDP calls with the given
+// connector_type — the LLM shim uses "llm" so audit rows and per-connector
+// policy scoping distinguish the two planes. The check-input/check-output
+// wire contract is otherwise plane-agnostic (text in, redacted text out).
+func (c *MCPClient) WithConnector(name string) *MCPClient {
+	cp := *c
+	if name != "" {
+		cp.connector = name
+	}
+	return &cp
+}
+
+func (c *MCPClient) connectorType() string {
+	if c.connector != "" {
+		return c.connector
+	}
+	return "mcp"
 }
 
 // MCPVerdict is the normalized outcome of a check-input / check-output call.
 type MCPVerdict struct {
-	Allowed    bool   // false ⇒ block the tool call
-	Redacted   string // masked content to substitute (empty ⇒ no change)
-	WasRedacted bool  // engine actually masked something
-	DecisionID string
-	Evaluated  bool // the redactor ran; false ⇒ fail closed (do not trust "clean")
-	Reason     string
+	Allowed     bool   // false ⇒ block the tool call
+	Redacted    string // masked content to substitute (empty ⇒ no change)
+	WasRedacted bool   // engine actually masked something
+	DecisionID  string
+	Evaluated   bool // the redactor ran; false ⇒ fail closed (do not trust "clean")
+	Reason      string
 }
 
 type checkInputReq struct {
@@ -80,7 +100,7 @@ type checkOutputResp struct {
 func (c *MCPClient) CheckInput(ctx context.Context, tool, args string) MCPVerdict {
 	body, _ := json.Marshal(checkInputReq{
 		ClientID: c.cfg.OrgID, TenantID: firstNonEmpty(c.cfg.TenantID, c.cfg.OrgID),
-		ConnectorType: "mcp", Tool: tool, Operation: "execute", Statement: args,
+		ConnectorType: c.connectorType(), Tool: tool, Operation: "execute", Statement: args,
 	})
 	var r checkInputResp
 	if !c.call(ctx, "/api/v1/mcp/check-input", body, &r) {
@@ -97,7 +117,7 @@ func (c *MCPClient) CheckInput(ctx context.Context, tool, args string) MCPVerdic
 func (c *MCPClient) CheckOutput(ctx context.Context, tool, result string) MCPVerdict {
 	body, _ := json.Marshal(checkOutputReq{
 		ClientID: c.cfg.OrgID, TenantID: firstNonEmpty(c.cfg.TenantID, c.cfg.OrgID),
-		ConnectorType: "mcp", Tool: tool, Message: result,
+		ConnectorType: c.connectorType(), Tool: tool, Message: result,
 	})
 	var r checkOutputResp
 	if !c.call(ctx, "/api/v1/mcp/check-output", body, &r) {
