@@ -8,9 +8,9 @@
 // wiring turns into a mutation or an immediate deny. No gRPC here, so it is
 // fully unit-testable — the same split as mcp_govern.go.
 //
-// Only chat-completions bodies are governed: anything without a messages[]
-// array (embeddings, rerank, admin calls) passes through untouched, exactly
-// like non-tools/call JSON-RPC passes through the MCP shim.
+// Chat-completions bodies (messages[]) and rerank bodies (query+documents[])
+// are governed; anything else (embeddings, admin calls) passes through
+// untouched, exactly like non-tools/call JSON-RPC passes through the MCP shim.
 package adapter
 
 import (
@@ -342,6 +342,93 @@ func GovernLLMResponseJSON(ctx context.Context, mcp *MCPClient, model string, bo
 	out, err := json.Marshal(fields)
 	if err != nil {
 		return BodyDecision{Action: ActionBlock, Reason: "response redaction rewrite failed (fail closed)", DecisionID: decisionID}
+	}
+	return BodyDecision{Action: ActionReplace, NewBody: out, DecisionID: decisionID}
+}
+
+// --- rerank plane (AID-100 governed-rerank follow-up) ---
+
+// rerankRequest is the decoded-enough view of a rerank request
+// ({model, query, documents:[str...]}). Only string documents are governed;
+// a request with object-shaped documents passes (logged by the caller) so an
+// unknown vendor shape can never be half-rewritten.
+type rerankRequest struct {
+	fields map[string]json.RawMessage
+	model  string
+	query  string
+	docs   []string
+}
+
+// parseRerankRequest decodes body as a rerank request. ok is false when the
+// body is not rerank-shaped (no query+documents) or documents are not all
+// plain strings.
+func parseRerankRequest(body []byte) (*rerankRequest, bool) {
+	var fields map[string]json.RawMessage
+	if json.Unmarshal(body, &fields) != nil {
+		return nil, false
+	}
+	rawQ, hasQ := fields["query"]
+	rawD, hasD := fields["documents"]
+	if !hasQ || !hasD {
+		return nil, false
+	}
+	rr := &rerankRequest{fields: fields}
+	if json.Unmarshal(rawQ, &rr.query) != nil {
+		return nil, false
+	}
+	if json.Unmarshal(rawD, &rr.docs) != nil {
+		return nil, false // object-shaped documents: not governable here
+	}
+	if m, ok := fields["model"]; ok {
+		_ = json.Unmarshal(m, &rr.model)
+	}
+	return rr, true
+}
+
+// GovernLLMRerankBody governs a rerank request body: the query and every
+// document string go through check-input (one joined call, per-span
+// fallback); a deny blocks, a redaction rewrites the strings in place. The
+// documents are retrieved chunks — exactly the content class the 2026-08-20
+// leak shipped — so this MUST be in place before rerank traffic is routed
+// through the gateway (the ext_authz capability flip promises body redaction
+// for every POST on the listener).
+func GovernLLMRerankBody(ctx context.Context, mcp *MCPClient, body []byte) BodyDecision {
+	rr, ok := parseRerankRequest(body)
+	if !ok {
+		return BodyDecision{Action: ActionPass}
+	}
+	texts := make([]string, 0, len(rr.docs)+1)
+	texts = append(texts, rr.query)
+	texts = append(texts, rr.docs...)
+	masked, decisionID, blocked := governTexts(ctx, texts, func(ctx context.Context, s string) MCPVerdict {
+		return mcp.CheckInput(ctx, rr.model, s)
+	})
+	if blocked != nil {
+		return *blocked
+	}
+	changed := false
+	for i := range texts {
+		if masked[i] != texts[i] {
+			changed = true
+			break
+		}
+	}
+	if !changed {
+		return BodyDecision{Action: ActionPass, DecisionID: decisionID}
+	}
+	qb, err := json.Marshal(masked[0])
+	if err != nil {
+		return BodyDecision{Action: ActionBlock, Reason: "rerank redaction rewrite failed (fail closed)", DecisionID: decisionID}
+	}
+	rr.fields["query"] = qb
+	db, err := json.Marshal(masked[1:])
+	if err != nil {
+		return BodyDecision{Action: ActionBlock, Reason: "rerank redaction rewrite failed (fail closed)", DecisionID: decisionID}
+	}
+	rr.fields["documents"] = db
+	out, err := json.Marshal(rr.fields)
+	if err != nil {
+		return BodyDecision{Action: ActionBlock, Reason: "rerank redaction rewrite failed (fail closed)", DecisionID: decisionID}
 	}
 	return BodyDecision{Action: ActionReplace, NewBody: out, DecisionID: decisionID}
 }

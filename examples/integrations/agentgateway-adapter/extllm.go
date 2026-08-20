@@ -137,10 +137,16 @@ func (s *ExtLLMServer) onRequestBody(ctx context.Context, ex *llmExchange, body 
 		log.Printf("llm-shim: BLOCK (request) body %dB exceeds ceiling %dB", len(full), s.cfg.MaxBodyBytes)
 		return immediate403(`{"error":{"type":"policy_violation","message":"request body exceeds the governable size ceiling"}}`)
 	}
+	d := BodyDecision{Action: ActionPass}
 	if cr, ok := parseChatRequest(full); ok {
 		ex.model = cr.model
+		d = GovernLLMRequestBody(ctx, s.mcp, full)
+	} else if rr, ok := parseRerankRequest(full); ok {
+		// rerank plane: the documents are retrieved chunks — the same content
+		// class the chat plane governs. Responses carry only scores.
+		ex.model = rr.model
+		d = GovernLLMRerankBody(ctx, s.mcp, full)
 	}
-	d := GovernLLMRequestBody(ctx, s.mcp, full)
 	switch d.Action {
 	case ActionBlock:
 		ex.blockedR = true

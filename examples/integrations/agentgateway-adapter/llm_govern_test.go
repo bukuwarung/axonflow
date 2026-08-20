@@ -202,3 +202,65 @@ func TestGovernLLMResponseJSON_BlockAndPass(t *testing.T) {
 		t.Fatalf("action=%v, want pass for non-completion body", pass.Action)
 	}
 }
+
+func rerankBody(query string, docs ...string) []byte {
+	b, _ := json.Marshal(map[string]any{
+		"model": "openrouter/nvidia/llama-nemotron-rerank-vl-1b-v2:free",
+		"query": query, "documents": docs,
+	})
+	return b
+}
+
+func TestGovernLLMRerank_RedactsQueryAndDocs(t *testing.T) {
+	var calls int64
+	d := GovernLLMRerankBody(context.Background(), countingPDP(t, &calls),
+		rerankBody("find the SECRET plan", "clean chunk", "chunk with SECRET inside", "another clean one"))
+	if d.Action != ActionReplace {
+		t.Fatalf("action=%v, want replace", d.Action)
+	}
+	if calls != 1 {
+		t.Fatalf("PDP calls=%d, want 1 (joined statement)", calls)
+	}
+	if strings.Contains(string(d.NewBody), "SECRET") {
+		t.Fatal("REDACTION LEAK in rerank body")
+	}
+	var out struct {
+		Model     string   `json:"model"`
+		Query     string   `json:"query"`
+		Documents []string `json:"documents"`
+	}
+	if err := json.Unmarshal(d.NewBody, &out); err != nil {
+		t.Fatalf("rewritten body is not a rerank request: %v", err)
+	}
+	if len(out.Documents) != 3 || out.Documents[0] != "clean chunk" || out.Documents[2] != "another clean one" {
+		t.Fatalf("document order/count disturbed: %+v", out.Documents)
+	}
+	if !strings.Contains(out.Documents[1], "****") || !strings.Contains(out.Query, "****") {
+		t.Fatalf("masking missing: q=%q d1=%q", out.Query, out.Documents[1])
+	}
+	if out.Model == "" {
+		t.Fatal("model field lost in rewrite")
+	}
+}
+
+func TestGovernLLMRerank_CleanPassesAndBlocks(t *testing.T) {
+	var calls int64
+	pdp := countingPDP(t, &calls)
+	if d := GovernLLMRerankBody(context.Background(), pdp, rerankBody("plain", "doc a", "doc b")); d.Action != ActionPass {
+		t.Fatalf("action=%v, want pass", d.Action)
+	}
+	if d := GovernLLMRerankBody(context.Background(), pdp, rerankBody("q", "BLOCKME chunk")); d.Action != ActionBlock {
+		t.Fatalf("action=%v, want block", d.Action)
+	}
+}
+
+func TestGovernLLMRerank_ObjectDocsPass(t *testing.T) {
+	var calls int64
+	body := []byte(`{"model":"m","query":"q with SECRET","documents":[{"text":"obj doc"}]}`)
+	if d := GovernLLMRerankBody(context.Background(), countingPDP(t, &calls), body); d.Action != ActionPass {
+		t.Fatalf("action=%v, want pass for object-shaped documents", d.Action)
+	}
+	if calls != 0 {
+		t.Fatalf("PDP calls=%d, want 0 for unparseable documents", calls)
+	}
+}
