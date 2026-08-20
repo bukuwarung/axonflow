@@ -56,6 +56,15 @@ type Config struct {
 	// MaxBodyBytes bounds how much of a request body the adapter will
 	// forward to the PDP (default 8 MiB).
 	MaxBodyBytes int
+
+	// CompanionBodyRedaction (AXONFLOW_COMPANION_BODY_REDACTION=true) tells the
+	// ext_authz adapter that a companion ext_proc shim on the SAME listener
+	// rewrites every request body via check-input (AID-100 Fix B). Only then is
+	// advertising request_body_redaction on /decide truthful, and only then may
+	// a request-phase redact_pii obligation be treated as discharged. Setting
+	// this WITHOUT the LLM extProc leg in the gateway config forwards
+	// unredacted content — see the pdp_client.go capability warning.
+	CompanionBodyRedaction bool
 }
 
 // FailOpen reports whether the configured fail-mode should forward on
@@ -88,6 +97,8 @@ func LoadConfigFromEnv() Config {
 		FailMode:         envOr("AXONFLOW_FAIL_MODE", "closed"),
 		RequestTimeout:   durationOr("AXONFLOW_REQUEST_TIMEOUT", 10*time.Second),
 		MaxBodyBytes:     intOr("AXONFLOW_MAX_BODY_BYTES", 8*1024*1024),
+		CompanionBodyRedaction: strings.EqualFold(
+			os.Getenv("AXONFLOW_COMPANION_BODY_REDACTION"), "true"),
 	}
 	return c
 }
