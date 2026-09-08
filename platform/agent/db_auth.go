@@ -19,6 +19,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"log"
+	"os"
 	"strings"
 	"sync"
 	"time"
@@ -73,6 +74,48 @@ type PricingTierInfo struct {
 	SupportSLAHours   int
 	Features          map[string]interface{}
 	Active            bool
+}
+
+// validateLicenseFn is the licence validator applied to client credentials. A
+// package variable so tests can inject expired/invalid verdicts without a
+// vendor signing key.
+var validateLicenseFn = license.ValidateLicense
+
+var expiredClientKeyNotice sync.Once
+
+// acceptExpiredClientKey reports whether an EXPIRED (past grace) but correctly
+// signed service key may still authenticate a client, and if so pins the
+// result to Community tier.
+//
+// BukuWarung fork (AID-247, Sept 2026). A self-hosted Community deployment runs
+// with no AXONFLOW_LICENSE_KEY of its own: its tier is Community by
+// construction and nothing in the platform is unlocked by a client's key. In
+// that posture the Ed25519-signed key presented as the Basic-auth password is
+// purely a client credential — the signature still binds the caller to its
+// org_id / service_name; only the vendor's commercial expiry has lapsed.
+// Refusing it would fail every governed call closed fleet-wide (Claude Code,
+// Cowork, the agentgateway adapters) the moment the seven-day grace ends.
+//
+// Scope is deliberately narrow:
+//   - only the LICENSE_EXPIRED verdict is tolerated — bad signatures, formats
+//     and prefixes keep failing exactly as before;
+//   - only when this deployment itself is unlicensed (no AXONFLOW_LICENSE_KEY);
+//     a licensed (Enterprise) deployment is unaffected;
+//   - the client is pinned to Community tier and limits, so the expired
+//     payload's tier never reaches rate limits or entitlements.
+func acceptExpiredClientKey(result *license.ValidationResult) bool {
+	if result == nil || result.Valid || result.Error != "LICENSE_EXPIRED" {
+		return false
+	}
+	if os.Getenv("AXONFLOW_LICENSE_KEY") != "" {
+		return false
+	}
+	result.Tier = license.TierCommunity
+	result.Limits = license.CommunityLimits
+	expiredClientKeyNotice.Do(func() {
+		log.Printf("[AUTH] Accepting expired-but-signed service keys as client credentials: this deployment runs without its own licence (Community); such clients are pinned to Community tier (BukuWarung fork, AID-247)")
+	})
+	return true
 }
 
 // validateClientCredentialsDB validates a client using database lookup.
@@ -169,12 +212,12 @@ func validateViaAPIKeys(ctx context.Context, db *sql.DB, clientID, clientSecret 
 	}
 
 	// Validate license key format using license validation system
-	validationResult, err := license.ValidateLicense(ctx, clientSecret)
+	validationResult, err := validateLicenseFn(ctx, clientSecret)
 	if err != nil {
 		return nil, fmt.Errorf("license validation failed: %w", err)
 	}
 
-	if !validationResult.Valid {
+	if !validationResult.Valid && !acceptExpiredClientKey(validationResult) {
 		return nil, fmt.Errorf("license invalid or expired: %s", validationResult.Error)
 	}
 
@@ -227,13 +270,13 @@ func validateViaOrganizations(ctx context.Context, db *sql.DB, clientID, clientS
 		logutil.Sanitize(clientID), isEd25519Format, len(clientSecret), logutil.MaskSecret(clientSecret, 10))
 
 	// First, validate the license key format cryptographically
-	validationResult, err := license.ValidateLicense(ctx, clientSecret)
+	validationResult, err := validateLicenseFn(ctx, clientSecret)
 	if err != nil {
 		log.Printf("[LICENSE-DEBUG] License validation ERROR: %v", err)
 		return nil, fmt.Errorf("license validation failed: %w", err)
 	}
 
-	if !validationResult.Valid {
+	if !validationResult.Valid && !acceptExpiredClientKey(validationResult) {
 		log.Printf("[LICENSE-DEBUG] License INVALID: %s", logutil.Sanitize(validationResult.Error))
 		return nil, fmt.Errorf("license invalid or expired: %s", validationResult.Error)
 	}
