@@ -322,11 +322,70 @@ func ValidatePAN(match string, context string) (bool, float64) {
 	return true, confidence
 }
 
+// roleMailboxLocals are canonical local-part tokens for unattended "role"
+// mailboxes. These identify no natural person, so they are not personal data
+// under GDPR Art.4(1) / UU PDP and must not be treated as a PII match.
+//
+// Tokens are compared after canonicalizeMailboxLocal strips a +tag suffix and
+// the . - _ separators, so one entry covers every spelling (no-reply, no_reply,
+// noreply+ci, do-not-reply, …).
+var roleMailboxLocals = map[string]bool{
+	"noreply":    true,
+	"donotreply": true,
+	"nobody":     true,
+}
+
+// roleMailboxDomainSuffixes are domains whose every address is an unattended
+// role mailbox — e.g. GitHub's users.noreply.github.com commit identities.
+var roleMailboxDomainSuffixes = []string{
+	"noreply.github.com",
+}
+
+// canonicalizeMailboxLocal folds a local part to its comparison form: lowercase,
+// +tag suffix dropped, separators removed.
+func canonicalizeMailboxLocal(local string) string {
+	local = strings.ToLower(local)
+	if plus := strings.IndexByte(local, '+'); plus >= 0 {
+		local = local[:plus]
+	}
+	return strings.NewReplacer(".", "", "-", "", "_", "").Replace(local)
+}
+
+// isRoleMailbox reports whether addr is an unattended role mailbox rather than
+// a person's address.
+func isRoleMailbox(addr string) bool {
+	at := strings.LastIndexByte(addr, '@')
+	if at < 0 {
+		return false
+	}
+	local, domain := addr[:at], strings.ToLower(addr[at+1:])
+
+	if roleMailboxLocals[canonicalizeMailboxLocal(local)] {
+		return true
+	}
+	for _, suffix := range roleMailboxDomainSuffixes {
+		if domain == suffix || strings.HasSuffix(domain, "."+suffix) {
+			return true
+		}
+	}
+	return false
+}
+
 // ValidateEmail validates email addresses.
 func ValidateEmail(match string, context string) (bool, float64) {
 	// Basic format validation
 	emailRegex := regexp.MustCompile(`^[a-zA-Z0-9._%+\-]+@[a-zA-Z0-9.\-]+\.[a-zA-Z]{2,}$`)
 	if !emailRegex.MatchString(match) {
+		return false, 0
+	}
+
+	// Role mailboxes are not personal data — drop the match so boilerplate
+	// addresses (commit-attribution trailers, CI bots, bug-report footers) do
+	// not consume a redaction obligation. Rejecting here rather than lowering
+	// confidence is deliberate: the engine acts on the boolean, and a PII
+	// policy resolved to redact denies the tool call outright regardless of
+	// the score.
+	if isRoleMailbox(match) {
 		return false, 0
 	}
 
