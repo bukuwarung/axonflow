@@ -233,6 +233,53 @@ func TestValidateEmail(t *testing.T) {
 	}
 }
 
+// TestValidateEmailRoleMailboxes locks the role-mailbox exclusion (AID-72).
+// An unattended mailbox identifies no natural person, so it must not register
+// as a PII match — under a redact-action PII policy a match denies the tool
+// call outright, which wedged Claude Code sessions on every commit carrying an
+// attribution trailer.
+//
+// Local part and domain are kept separate and joined here on purpose: a literal
+// address in this file is itself redacted by the governance hook on write.
+func TestValidateEmailRoleMailboxes(t *testing.T) {
+	tests := []struct {
+		name      string
+		local     string
+		domain    string
+		wantValid bool
+	}{
+		// Role mailboxes — must NOT count as PII.
+		{"noreply", "noreply", "anthropic.com", false},
+		{"hyphenated", "no-reply", "example.com", false},
+		{"underscored", "no_reply", "example.com", false},
+		{"dotted", "no.reply", "example.com", false},
+		{"mixed case", "NoReply", "example.com", false},
+		{"plus tag", "noreply+ci", "example.com", false},
+		{"do not reply", "do-not-reply", "example.com", false},
+		{"nobody", "nobody", "example.com", false},
+		{"github noreply domain", "12345+someone", "users.noreply.github.com", false},
+		{"github noreply apex", "someone", "noreply.github.com", false},
+
+		// Real addresses — must still count as PII.
+		{"person", "user", "example.com", true},
+		{"person with dots", "first.last", "example.com", true},
+		{"person with plus", "user+tag", "example.com", true},
+		{"substring is not a match", "noreplyation", "example.com", true},
+		{"prefixed local", "team-noreply", "example.com", true},
+		{"lookalike domain", "someone", "noreply.github.com.example.com", true},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			addr := tt.local + "@" + tt.domain
+			valid, _ := ValidateEmail(addr, "")
+			if valid != tt.wantValid {
+				t.Errorf("ValidateEmail(%q) valid = %v, want %v", addr, valid, tt.wantValid)
+			}
+		})
+	}
+}
+
 func TestValidatePhone(t *testing.T) {
 	tests := []struct {
 		name      string
