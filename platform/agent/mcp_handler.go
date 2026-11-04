@@ -191,8 +191,7 @@ func logMCPQueryAudit(entry MCPQueryAuditEntry) {
 	if err := auditQueue.LogMCPQueryAudit(entry); err != nil {
 		log.Printf("[MCP Audit] Failed to log audit entry: %v", err)
 	} else {
-		log.Printf("[MCP Audit] Logged: connector=%s, blocked=%v, redacted=%v, exfil=%v",
-			entry.ConnectorName, entry.RequestBlocked, entry.ResponseRedacted, entry.ExfilExceeded)
+		reportMCPAuditWrite(entry)
 	}
 }
 
