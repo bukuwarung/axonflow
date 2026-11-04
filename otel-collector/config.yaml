@@ -35,9 +35,6 @@ exporters:
     tls:
       insecure: true
 
-  debug:
-    verbosity: basic
-
 extensions:
   health_check:
     endpoint: 0.0.0.0:13133
@@ -48,7 +45,7 @@ service:
     traces:
       receivers: [otlp]
       processors: [memory_limiter, batch]
-      exporters: [otlphttp/tempo, debug]
+      exporters: [otlphttp/tempo]
 
   telemetry:
     logs:
