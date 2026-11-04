@@ -77,7 +77,10 @@ done
 if [ -z "$ORG" ]; then ORG="${AXONFLOW_ORG_ID:-}"; fi
 if [ -z "$ORG" ]; then ORG="${ORG_ID:-}"; fi
 if [ -z "$ORG" ] && [ -f .env ]; then
-  ORG="$(grep -E '^(AXONFLOW_ORG_ID|ORG_ID)=' .env | head -1 | cut -d= -f2- | tr -d '"' )"
+  # `|| true` prevents `set -euo pipefail` from killing the script when .env
+  # has no matching line (grep → 1) or multiple matches (head closes stdin →
+  # grep SIGPIPE → 141); the empty-$ORG branch below already handles both.
+  ORG="$(grep -E '^(AXONFLOW_ORG_ID|ORG_ID)=' .env | head -1 | cut -d= -f2- | tr -d '"' || true)"
 fi
 [ -n "$ORG" ] || fail "Could not resolve the org id. Pass --org <ORG_ID>, or set AXONFLOW_ORG_ID, or run from a directory with a .env that defines AXONFLOW_ORG_ID."
 

@@ -46,7 +46,13 @@ if [ -z "$ORG" ] || [ -z "$LIC" ]; then
   bad "AXONFLOW_ORG_ID / AXONFLOW_LICENSE_KEY not set (source .env first)"; exit 1
 fi
 AUTH=$(printf '%s:%s' "$ORG" "$LIC" | base64 | tr -d '\n')
-WORK="$(mktemp -d)"; trap 'rm -rf "$WORK"' EXIT
+WORK="$(mktemp -d)"
+# Name the ephemeral prod-check container up front and clean it on any exit
+# (including Ctrl-C) — otherwise an interrupted step-7 leaves a stale
+# detached container holding the name and consuming resources.
+EPH="axonflow-devtoken-prodcheck-$$"
+_cleanup() { rm -rf "$WORK"; docker rm -f "$EPH" >/dev/null 2>&1 || true; }
+trap _cleanup EXIT INT TERM
 
 echo ""; log "AxonFlow end-to-end auth smoke"
 echo "  agent=$AGENT_URL  orchestrator=$ORCH_URL  org=$ORG"
@@ -137,7 +143,7 @@ else
   else
     IMG=$(docker inspect --format '{{.Config.Image}}' "$CONTAINER" 2>/dev/null)
     NET=$(docker inspect --format '{{range $k,$_ := .NetworkSettings.Networks}}{{$k}}{{"\n"}}{{end}}' "$CONTAINER" 2>/dev/null | head -1)
-    EPH="axonflow-devtoken-prodcheck-$$"
+    # EPH is set globally at the top so the trap can clean it on SIGINT.
    if [ -z "$IMG" ] || [ -z "$NET" ]; then
     bad "could not inspect agent container '$CONTAINER' (image/network not found) — set AGENT_CONTAINER to a running agent, or SKIP_PROD_CHECK=1"
    else

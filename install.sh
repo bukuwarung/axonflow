@@ -12,10 +12,10 @@ COMPOSE_FILE="${SCRIPT_DIR}/docker-compose.yml"
 # Helpers
 # --------------------------------------------------------------------------
 
-log()   { printf '\033[1;34m[axonflow]\033[0m %s\n' "$*"; }
-ok()    { printf '\033[1;32m[axonflow]\033[0m %s\n' "$*"; }
-warn()  { printf '\033[1;33m[axonflow]\033[0m %s\n' "$*"; }
-fail()  { printf '\033[1;31m[axonflow]\033[0m %s\n' "$*" >&2; exit 1; }
+log()   { printf '\033[1;34m[axonflow]\033[0m %b\n' "$*"; }
+ok()    { printf '\033[1;32m[axonflow]\033[0m %b\n' "$*"; }
+warn()  { printf '\033[1;33m[axonflow]\033[0m %b\n' "$*"; }
+fail()  { printf '\033[1;31m[axonflow]\033[0m %b\n' "$*" >&2; exit 1; }
 
 # --------------------------------------------------------------------------
 # Pre-flight checks
@@ -83,8 +83,10 @@ for var in "${REQUIRED_VARS[@]}"; do
   if [ -z "$val" ]; then
     MISSING+=("$var")
   fi
-  # Catch unfilled placeholders
-  if [[ "$val" == *"replace-with"* ]] || [[ "$val" == *"paste-from"* ]] || [[ "$val" == *"<"*">"* ]]; then
+  # Catch unfilled placeholders. The angle-bracket check is anchored to the
+  # whole value (`^<…>$`) so a legitimately generated password containing `<`
+  # and `>` somewhere in the middle — e.g. `aB3<xY>9!` — is not rejected.
+  if [[ "$val" == *"replace-with"* ]] || [[ "$val" == *"paste-from"* ]] || [[ "$val" =~ ^\<.*\>$ ]]; then
     MISSING+=("$var (still has placeholder value)")
   fi
 done
@@ -135,8 +137,10 @@ INTERVAL=5
 
 while [ "$ELAPSED" -lt "$MAX_WAIT" ]; do
   ALL_HEALTHY=true
+  CHECKED=0
   SERVICES=$(docker compose --env-file "$ENV_FILE" -f "$COMPOSE_FILE" ps --format '{{.Name}}' 2>/dev/null)
   for svc in $SERVICES; do
+    CHECKED=$((CHECKED + 1))
     STATUS=$(docker inspect --format='{{if .State.Health}}{{.State.Health.Status}}{{else}}no-healthcheck{{end}}' "$svc" 2>/dev/null || echo "unknown")
     if [ "$STATUS" != "healthy" ] && [ "$STATUS" != "no-healthcheck" ]; then
       ALL_HEALTHY=false
@@ -144,7 +148,10 @@ while [ "$ELAPSED" -lt "$MAX_WAIT" ]; do
     fi
   done
 
-  if $ALL_HEALTHY; then
+  # Only break when we actually iterated at least one container — a transient
+  # empty `docker compose ps` output (daemon hiccup, mid-boot race) must not
+  # be interpreted as "all services healthy".
+  if $ALL_HEALTHY && [ "$CHECKED" -gt 0 ]; then
     break
   fi
 
@@ -153,7 +160,7 @@ while [ "$ELAPSED" -lt "$MAX_WAIT" ]; do
   log "Still waiting... (${ELAPSED}s / ${MAX_WAIT}s)"
 done
 
-if ! $ALL_HEALTHY; then
+if ! $ALL_HEALTHY || [ "${CHECKED:-0}" -eq 0 ]; then
   warn "Some services did not become healthy within ${MAX_WAIT}s."
   warn "Run 'docker compose logs' to investigate."
   docker compose --env-file "$ENV_FILE" -f "$COMPOSE_FILE" ps

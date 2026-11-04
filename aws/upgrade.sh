@@ -39,7 +39,7 @@ ECR_REGISTRY="${ECR_REGISTRY:?set ECR_REGISTRY (flag/env/upgrade.env)}"
 TEMPLATE_URL="${TEMPLATE_URL:-}"
 
 ECR_HOST="${ECR_REGISTRY%%/*}"
-REGION="${REGION:-$(echo "$ECR_HOST" | sed -nE 's/^[0-9]+\.dkr\.ecr\.([a-z0-9-]+)\.amazonaws\.com$/\1/p')}"
+REGION="${REGION:-$(echo "$ECR_HOST" | sed -nE 's/^[0-9]+\.dkr\.ecr\.([a-z0-9-]+)\.amazonaws\.com(\.cn)?$/\1/p')}"
 : "${REGION:?could not derive REGION from ECR_REGISTRY; set REGION explicitly}"
 
 # The 6 image-tag parameters flipped on upgrade.
@@ -53,7 +53,12 @@ TAG_PARAMS=(
 )
 
 # Read the current stack parameters once (keys, and the registry value).
-mapfile -t CUR_KEYS < <(aws cloudformation describe-stacks --region "$REGION" \
+# NB: avoid `mapfile`/`readarray` — not available on macOS's bundled bash 3.2,
+# where Mac operators run this script.
+CUR_KEYS=()
+while IFS= read -r _k; do
+  [ -n "$_k" ] && CUR_KEYS+=("$_k")
+done < <(aws cloudformation describe-stacks --region "$REGION" \
   --stack-name "$STACK_NAME" --query 'Stacks[0].Parameters[].ParameterKey' --output text | tr '\t' '\n')
 if [ "${#CUR_KEYS[@]}" -eq 0 ]; then
   echo "FATAL: stack $STACK_NAME not found or has no parameters"; exit 1
