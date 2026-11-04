@@ -32,10 +32,22 @@
 #        + customer-portal Dockerfiles; portal-ui keeps node-based health probe;
 #        prometheus + grafana + otel-collector + tempo keep their native probes)
 
+# json-file log rotation defaults applied to every service via `logging:
+# *default-logging`. Without this, Docker's default is unlimited and
+# /var/lib/docker/containers/*/*-json.log fills the host disk until the
+# daemon stalls (observed in long-running install bundles where agent +
+# orchestrator access logs dominate).
+x-logging: &default-logging
+  driver: json-file
+  options:
+    max-size: "10m"
+    max-file: "3"
+
 services:
   postgres:
     image: postgres:15-alpine
     restart: unless-stopped
+    logging: *default-logging
     environment:
       POSTGRES_USER: axonflow
       POSTGRES_PASSWORD: "${AXONFLOW_DB_PASSWORD}"
@@ -56,8 +68,13 @@ services:
   redis:
     image: redis:7-alpine
     restart: unless-stopped
+    logging: *default-logging
     ports:
       - "127.0.0.1:6379:6379"
+    # Persist RDB snapshots so cached state (rate-limit counters, queued audit
+    # retries, session data) is not silently lost on `docker compose down && up`.
+    volumes:
+      - redis-data:/data
     healthcheck:
       test: ["CMD", "redis-cli", "ping"]
       interval: 10s
@@ -70,6 +87,7 @@ services:
     image: ${AXONFLOW_REGISTRY}/axonflow-agent@${AGENT_DIGEST}
     platform: linux/amd64
     restart: unless-stopped
+    logging: *default-logging
     environment:
       DATABASE_HOST: postgres
       DATABASE_PORT: 5432
@@ -180,6 +198,7 @@ services:
     image: ${AXONFLOW_REGISTRY}/axonflow-orchestrator@${ORCHESTRATOR_DIGEST}
     platform: linux/amd64
     restart: unless-stopped
+    logging: *default-logging
     environment:
       DATABASE_HOST: postgres
       DATABASE_PORT: 5432
@@ -244,6 +263,7 @@ services:
     image: ${AXONFLOW_REGISTRY}/axonflow-customer-portal@${PORTAL_DIGEST}
     platform: linux/amd64
     restart: unless-stopped
+    logging: *default-logging
     environment:
       DATABASE_HOST: postgres
       DATABASE_PORT: 5432
@@ -269,7 +289,7 @@ services:
       # placeholder license. Set false so the HTTP eval flow works.
       # SECURITY: only acceptable on a trusted internal network / eval. If you
       # expose the portal beyond localhost, front it with TLS and remove this.
-      AXONFLOW_PORTAL_COOKIE_SECURE: "false"
+      AXONFLOW_PORTAL_COOKIE_SECURE: "${AXONFLOW_PORTAL_COOKIE_SECURE:-false}"
       # G1 — must match agent's value for HMAC verification when portal calls agent
       AXONFLOW_INTERNAL_SERVICE_SECRET: "${AXONFLOW_INTERNAL_SERVICE_SECRET}"
       # #2552 — bootstrap the deployment org's portal login password on first
@@ -282,6 +302,13 @@ services:
       - "127.0.0.1:8082:8080"
     depends_on:
       axonflow-agent:
+        condition: service_healthy
+      # Portal calls the orchestrator API (policy management, approvals);
+      # without this, a `docker compose restart` can start the portal before
+      # orchestrator is ready → first API call 502s until orchestrator catches up.
+      axonflow-orchestrator:
+        condition: service_healthy
+      postgres:
         condition: service_healthy
     # G9 — curl is installed in the customer-portal Dockerfile
     healthcheck:
@@ -302,6 +329,7 @@ services:
     image: ${AXONFLOW_REGISTRY}/axonflow-customer-portal-ui@${PORTAL_UI_DIGEST}
     platform: linux/amd64
     restart: unless-stopped
+    logging: *default-logging
     environment:
       API_BACKEND_URL: http://axonflow-customer-portal:8080
       # G7 — NODE_ENV + HOSTNAME mirror CFN CustomerPortalUITaskDefinition.
@@ -333,6 +361,7 @@ services:
   otel-collector:
     image: otel/opentelemetry-collector-contrib:0.128.0
     restart: unless-stopped
+    logging: *default-logging
     command: ["--config=/etc/otelcol-contrib/config.yaml"]
     volumes:
       - ./otel-collector/config.yaml:/etc/otelcol-contrib/config.yaml:ro
@@ -355,6 +384,7 @@ services:
   tempo:
     image: grafana/tempo:2.7.2
     restart: unless-stopped
+    logging: *default-logging
     command: ["-config.file=/etc/tempo/tempo.yaml"]
     volumes:
       - ./tempo/config.yaml:/etc/tempo/tempo.yaml:ro
@@ -376,6 +406,7 @@ services:
     image: ${AXONFLOW_REGISTRY}/axonflow-prometheus@${PROMETHEUS_DIGEST}
     platform: linux/amd64
     restart: unless-stopped
+    logging: *default-logging
     environment:
       STACK_NAME: axonflow
     ports:
@@ -403,6 +434,7 @@ services:
     image: ${AXONFLOW_REGISTRY}/axonflow-grafana@${GRAFANA_DIGEST}
     platform: linux/amd64
     restart: unless-stopped
+    logging: *default-logging
     environment:
       STACK_NAME: axonflow
       GF_SECURITY_ADMIN_PASSWORD: "${GRAFANA_ADMIN_PASSWORD}"
@@ -444,6 +476,9 @@ services:
     volumes:
       - grafana-data:/var/lib/grafana
       - ./grafana/provisioning/datasources/tempo.yaml:/etc/grafana/provisioning/datasources/tempo.yaml:ro
+      # Dashboard provider YAML — without this, Grafana does not discover the
+      # dashboard JSON below and the Decision Mode Traces panel never appears.
+      - ./grafana/provisioning/dashboards/axonflow.yaml:/etc/grafana/provisioning/dashboards/axonflow.yaml:ro
       - ./grafana/provisioning/dashboards/decision-mode-traces.json:/var/lib/grafana/dashboards/decision-mode-traces.json:ro
     # G8 — mirror CFN GrafanaTaskDefinition Cpu: '512' / Memory: '1024'
     mem_limit: 1g
@@ -459,6 +494,9 @@ volumes:
   grafana-data:
     driver: local
   tempo-data:
+    driver: local
+  # Persist Redis RDB snapshots across `docker compose down && up`.
+  redis-data:
     driver: local
   # G4 — audit fallback storage for the agent
   audit-data:

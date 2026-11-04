@@ -1,0 +1,24 @@
+# Grafana dashboard provider - bundled install stack
+#
+# Grafana only auto-loads dashboards listed by a provider YAML under
+# /etc/grafana/provisioning/dashboards/*.yaml. Without this file, the
+# `decision-mode-traces.json` dashboard mounted at
+# /var/lib/grafana/dashboards/ is never discovered, so the Decision Mode
+# Traces panel silently never appears in the Grafana UI.
+#
+# This provider scans /var/lib/grafana/dashboards for JSON dashboards and
+# publishes them under the "AxonFlow" folder on first boot.
+
+apiVersion: 1
+
+providers:
+  - name: axonflow
+    orgId: 1
+    folder: AxonFlow
+    type: file
+    disableDeletion: false
+    updateIntervalSeconds: 30
+    allowUiUpdates: false
+    options:
+      path: /var/lib/grafana/dashboards
+      foldersFromFilesStructure: false
