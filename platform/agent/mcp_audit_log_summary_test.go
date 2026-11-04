@@ -19,24 +19,24 @@ import (
 
 var summaryStart = time.Date(2026, 11, 4, 3, 0, 0, 0, time.UTC)
 
-func TestMCPAuditLogSummary_FirstWriteIsLoggedAtOnce(t *testing.T) {
+func TestMCPAuditLogSummary_FirstEntryIsLoggedAtOnce(t *testing.T) {
 	s := newMCPAuditLogSummary(5 * time.Minute)
 
 	got := s.record(MCPQueryAuditEntry{ConnectorName: "otel-audit", ResponseRedacted: true}, summaryStart)
 
-	want := "[MCP Audit] Logged 1 entry (first since start; later writes are summarized every 5m0s): blocked=0, redacted=1, exfil=0, connectors: otel-audit=1"
+	want := `[MCP Audit] Logged 1 entry (first since start; later entries are summarized every 5m0s): blocked=0, redacted=1, exfil=0, connectors: "otel-audit"=1`
 	if got != want {
-		t.Fatalf("first write:\n got %q\nwant %q", got, want)
+		t.Fatalf("first entry:\n got %q\nwant %q", got, want)
 	}
 }
 
 func TestMCPAuditLogSummary_OneLinePerInterval(t *testing.T) {
 	s := newMCPAuditLogSummary(5 * time.Minute)
 	if s.record(MCPQueryAuditEntry{ConnectorName: "otel-audit"}, summaryStart) == "" {
-		t.Fatal("first write was not logged")
+		t.Fatal("first entry was not logged")
 	}
 
-	// One write a second for the rest of the interval: nothing is logged.
+	// One entry a second for the rest of the interval: nothing is logged.
 	for i := 1; i < 300; i++ {
 		entry := MCPQueryAuditEntry{
 			ConnectorName:    "otel-audit",
@@ -48,25 +48,25 @@ func TestMCPAuditLogSummary_OneLinePerInterval(t *testing.T) {
 			entry.ExfilExceeded = true
 		}
 		if line := s.record(entry, summaryStart.Add(time.Duration(i)*time.Second)); line != "" {
-			t.Fatalf("write %d inside the interval was logged: %q", i, line)
+			t.Fatalf("entry %d inside the interval was logged: %q", i, line)
 		}
 	}
 
-	// The first write once the interval has passed reports the whole window.
+	// The first entry once the interval has passed reports the whole window.
 	got := s.record(MCPQueryAuditEntry{ConnectorName: "otel-audit"}, summaryStart.Add(5*time.Minute))
-	want := "[MCP Audit] Logged 300 entries in the last 5m0s: blocked=2, redacted=29, exfil=1, connectors: otel-audit=299, postgres=1"
+	want := `[MCP Audit] Logged 300 entries in the last 5m0s: blocked=2, redacted=29, exfil=1, connectors: "otel-audit"=299, "postgres"=1`
 	if got != want {
 		t.Fatalf("summary:\n got %q\nwant %q", got, want)
 	}
 
 	// The counts restart after a line, and the next line waits a full interval.
 	if line := s.record(MCPQueryAuditEntry{ConnectorName: "otel-audit"}, summaryStart.Add(5*time.Minute+time.Second)); line != "" {
-		t.Fatalf("write right after a line was logged: %q", line)
+		t.Fatalf("entry right after a line was logged: %q", line)
 	}
 
-	// After a quiet spell the next write reports the time since the last line.
+	// After a quiet spell the next entry reports the time since the last line.
 	got = s.record(MCPQueryAuditEntry{ConnectorName: "otel-audit", RequestBlocked: true}, summaryStart.Add(time.Hour))
-	want = "[MCP Audit] Logged 2 entries in the last 55m0s: blocked=1, redacted=0, exfil=0, connectors: otel-audit=2"
+	want = `[MCP Audit] Logged 2 entries in the last 55m0s: blocked=1, redacted=0, exfil=0, connectors: "otel-audit"=2`
 	if got != want {
 		t.Fatalf("summary after a quiet spell:\n got %q\nwant %q", got, want)
 	}
@@ -76,22 +76,48 @@ func TestMCPAuditLogSummary_BoundsConnectorNames(t *testing.T) {
 	s := newMCPAuditLogSummary(time.Minute)
 	s.record(MCPQueryAuditEntry{ConnectorName: "otel-audit"}, summaryStart)
 
-	// Three times as many distinct names as the bound: the first names keep
-	// their own count and the rest are counted under "other".
+	// A real connector named "other" takes a slot and keeps its own count,
+	// apart from the overflow.
+	s.record(MCPQueryAuditEntry{ConnectorName: "other"}, summaryStart.Add(time.Second))
+	// Three times as many distinct names as the bound: the first ones fill
+	// the remaining slots and the rest are counted together as other.
 	for i := 0; i < 3*mcpAuditLogMaxConnectors; i++ {
 		s.record(MCPQueryAuditEntry{ConnectorName: fmt.Sprintf("c%02d", i)}, summaryStart.Add(time.Second))
 	}
 	got := s.record(MCPQueryAuditEntry{ConnectorName: "c00"}, summaryStart.Add(time.Minute))
 
-	counts := []string{"c00=2"}
-	for i := 1; i < mcpAuditLogMaxConnectors; i++ {
-		counts = append(counts, fmt.Sprintf("c%02d=1", i))
+	counts := []string{`"c00"=2`}
+	for i := 1; i < mcpAuditLogMaxConnectors-1; i++ {
+		counts = append(counts, fmt.Sprintf(`"c%02d"=1`, i))
 	}
-	counts = append(counts, fmt.Sprintf("other=%d", 2*mcpAuditLogMaxConnectors))
+	counts = append(counts, `"other"=1`, fmt.Sprintf("other=%d", 2*mcpAuditLogMaxConnectors+1))
 	want := fmt.Sprintf("[MCP Audit] Logged %d entries in the last 1m0s: blocked=0, redacted=0, exfil=0, connectors: %s",
-		3*mcpAuditLogMaxConnectors+1, strings.Join(counts, ", "))
+		3*mcpAuditLogMaxConnectors+2, strings.Join(counts, ", "))
 	if got != want {
 		t.Fatalf("bounded summary:\n got %q\nwant %q", got, want)
+	}
+}
+
+func TestMCPAuditLogSummary_ConnectorNameCannotBreakTheLine(t *testing.T) {
+	s := newMCPAuditLogSummary(time.Minute)
+
+	got := s.record(MCPQueryAuditEntry{ConnectorName: "x\n2026/11/04 03:00:00 [MCP Audit] Logged 0 entries"}, summaryStart)
+
+	if strings.ContainsAny(got, "\r\n") {
+		t.Fatalf("a connector name broke the line: %q", got)
+	}
+	if want := `connectors: "x\n2026/11/04 03:00:00 [MCP Audit] Logged 0 entries"=1`; !strings.HasSuffix(got, want) {
+		t.Fatalf("connector name not escaped:\n got %q\nwant suffix %q", got, want)
+	}
+}
+
+func TestMCPAuditLogSummary_CutsLongConnectorNames(t *testing.T) {
+	s := newMCPAuditLogSummary(time.Minute)
+
+	got := s.record(MCPQueryAuditEntry{ConnectorName: strings.Repeat("a", 10*mcpAuditLogMaxNameLen)}, summaryStart)
+
+	if want := fmt.Sprintf("connectors: %q=1", strings.Repeat("a", mcpAuditLogMaxNameLen)); !strings.HasSuffix(got, want) {
+		t.Fatalf("long connector name:\n got %q\nwant suffix %q", got, want)
 	}
 }
 
@@ -100,24 +126,24 @@ func TestMCPAuditLogSummary_EmptyConnectorName(t *testing.T) {
 
 	got := s.record(MCPQueryAuditEntry{}, summaryStart)
 
-	if !strings.HasSuffix(got, "connectors: (none)=1") {
+	if !strings.HasSuffix(got, `connectors: ""=1`) {
 		t.Fatalf("entry without a connector name: %q", got)
 	}
 }
 
-func TestMCPAuditLogSummary_ConcurrentWritesAreAllCounted(t *testing.T) {
+func TestMCPAuditLogSummary_ConcurrentEntriesAreAllCounted(t *testing.T) {
 	s := newMCPAuditLogSummary(time.Hour)
 	s.record(MCPQueryAuditEntry{ConnectorName: "otel-audit"}, summaryStart)
 
-	const goroutines, writes = 8, 1000
+	const goroutines, entries = 8, 1000
 	var wg sync.WaitGroup
 	for g := 0; g < goroutines; g++ {
 		wg.Add(1)
 		go func() {
 			defer wg.Done()
-			for i := 0; i < writes; i++ {
+			for i := 0; i < entries; i++ {
 				if line := s.record(MCPQueryAuditEntry{ConnectorName: "otel-audit"}, summaryStart.Add(time.Minute)); line != "" {
-					t.Errorf("write inside the interval was logged: %q", line)
+					t.Errorf("entry inside the interval was logged: %q", line)
 					return
 				}
 			}
@@ -126,16 +152,16 @@ func TestMCPAuditLogSummary_ConcurrentWritesAreAllCounted(t *testing.T) {
 	wg.Wait()
 
 	got := s.record(MCPQueryAuditEntry{ConnectorName: "otel-audit"}, summaryStart.Add(time.Hour))
-	total := goroutines*writes + 1
-	want := fmt.Sprintf("[MCP Audit] Logged %d entries in the last 1h0m0s: blocked=0, redacted=0, exfil=0, connectors: otel-audit=%d", total, total)
+	total := goroutines*entries + 1
+	want := fmt.Sprintf(`[MCP Audit] Logged %d entries in the last 1h0m0s: blocked=0, redacted=0, exfil=0, connectors: "otel-audit"=%d`, total, total)
 	if got != want {
-		t.Fatalf("summary after concurrent writes:\n got %q\nwant %q", got, want)
+		t.Fatalf("summary after concurrent entries:\n got %q\nwant %q", got, want)
 	}
 }
 
-// TestLogMCPQueryAudit_SummarizesSuccessfulWrites drives the real write path:
-// several successful writes inside one interval produce a single log line.
-func TestLogMCPQueryAudit_SummarizesSuccessfulWrites(t *testing.T) {
+// TestLogMCPQueryAudit_SummarizesAcceptedEntries drives the real path:
+// several entries the queue accepts inside one interval produce one line.
+func TestLogMCPQueryAudit_SummarizesAcceptedEntries(t *testing.T) {
 	db, mock, err := sqlmock.New()
 	if err != nil {
 		t.Fatalf("failed to create mock db: %v", err)
@@ -192,6 +218,6 @@ func TestLogMCPQueryAudit_SummarizesSuccessfulWrites(t *testing.T) {
 		t.Fatalf("unfulfilled mock expectations: %v", err)
 	}
 	if n := strings.Count(buf.String(), "[MCP Audit] Logged"); n != 1 {
-		t.Fatalf("%d successful writes logged %d lines, want 1:\n%s", writes, n, buf.String())
+		t.Fatalf("%d accepted entries logged %d lines, want 1:\n%s", writes, n, buf.String())
 	}
 }
