@@ -111,13 +111,20 @@ func TestMCPAuditLogSummary_ConnectorNameCannotBreakTheLine(t *testing.T) {
 	}
 }
 
-func TestMCPAuditLogSummary_CutsLongConnectorNames(t *testing.T) {
+func TestMCPAuditLogSummary_LongConnectorNamesCountAsOther(t *testing.T) {
 	s := newMCPAuditLogSummary(time.Minute)
+	s.record(MCPQueryAuditEntry{ConnectorName: "otel-audit"}, summaryStart)
 
-	got := s.record(MCPQueryAuditEntry{ConnectorName: strings.Repeat("a", 10*mcpAuditLogMaxNameLen)}, summaryStart)
+	// A name at the limit keeps its own count. Longer names that share it as
+	// a prefix are neither merged into it nor shown cut: they count as other.
+	limit := strings.Repeat("a", mcpAuditLogMaxNameLen)
+	s.record(MCPQueryAuditEntry{ConnectorName: limit}, summaryStart.Add(time.Second))
+	s.record(MCPQueryAuditEntry{ConnectorName: limit + "b"}, summaryStart.Add(time.Second))
+	got := s.record(MCPQueryAuditEntry{ConnectorName: limit + "c"}, summaryStart.Add(time.Minute))
 
-	if want := fmt.Sprintf("connectors: %q=1", strings.Repeat("a", mcpAuditLogMaxNameLen)); !strings.HasSuffix(got, want) {
-		t.Fatalf("long connector name:\n got %q\nwant suffix %q", got, want)
+	want := fmt.Sprintf("[MCP Audit] Logged 3 entries in the last 1m0s: blocked=0, redacted=0, exfil=0, connectors: %q=1, other=2", limit)
+	if got != want {
+		t.Fatalf("long connector names:\n got %q\nwant %q", got, want)
 	}
 }
 

@@ -26,9 +26,9 @@ import (
 const mcpAuditLogInterval = 5 * time.Minute
 
 // Connector names come from the request (connector_type), so a summary keeps
-// its own count for at most mcpAuditLogMaxConnectors names, cut to
-// mcpAuditLogMaxNameLen bytes, and counts the rest together as other, instead
-// of growing the map and the log line with whatever a caller sends.
+// its own count for at most mcpAuditLogMaxConnectors names of at most
+// mcpAuditLogMaxNameLen bytes and counts every other entry together as other,
+// instead of growing the map and the log line with whatever a caller sends.
 const (
 	mcpAuditLogMaxConnectors = 20
 	mcpAuditLogMaxNameLen    = 64
@@ -85,13 +85,12 @@ func (s *mcpAuditLogSummary) record(entry MCPQueryAuditEntry, now time.Time) str
 	if entry.ExfilExceeded {
 		s.exfil++
 	}
-	name := entry.ConnectorName
-	if len(name) > mcpAuditLogMaxNameLen {
-		name = name[:mcpAuditLogMaxNameLen]
-	}
-	if _, known := s.connectors[name]; known || len(s.connectors) < mcpAuditLogMaxConnectors {
+	switch name := entry.ConnectorName; {
+	case len(name) > mcpAuditLogMaxNameLen:
+		s.otherConnectors++
+	case s.connectors[name] > 0 || len(s.connectors) < mcpAuditLogMaxConnectors:
 		s.connectors[name]++
-	} else {
+	default:
 		s.otherConnectors++
 	}
 
