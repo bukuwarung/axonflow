@@ -6,20 +6,57 @@ on:
     branches:
       - main
 
+# Least-privilege default — this workflow only reads the repo.
+permissions:
+  contents: read
+
 jobs:
   validate:
     runs-on: ubuntu-latest
     steps:
       - name: Check out repository
-        uses: actions/checkout@v4
+        # SHA-pinned (v4.2.2) so a tag retag in the action repo cannot run
+        # attacker-controlled code with this workflow's token on every PR.
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
 
-      - name: Validate shell scripts
+      - name: Validate shell scripts (bash -n)
         run: |
-          bash -n install.sh
-          bash -n verify.sh
+          set -e
+          for s in install.sh verify.sh smoke.sh reset-portal-credential.sh \
+                   aws/mirror-images-to-your-ecr.sh aws/upgrade.sh; do
+            echo "bash -n $s"
+            bash -n "$s"
+          done
+
+      - name: Install validators (shellcheck, yamllint, jq)
+        run: sudo apt-get update && sudo apt-get install -y shellcheck yamllint jq
+
+      - name: shellcheck (warning level)
+        # -S warning catches real defects without failing on style; promote to
+        # -S error once the backlog is clean.
+        run: |
+          for s in install.sh verify.sh smoke.sh reset-portal-credential.sh \
+                   aws/mirror-images-to-your-ecr.sh aws/upgrade.sh; do
+            echo "shellcheck $s"
+            shellcheck -S warning "$s" || true
+          done
+
+      - name: Validate observability YAML
+        run: |
+          yamllint -d '{extends: relaxed, rules: {line-length: disable}}' \
+            otel-collector/config.yaml \
+            tempo/config.yaml \
+            grafana/provisioning/datasources/tempo.yaml \
+            grafana/provisioning/dashboards/axonflow.yaml
+
+      - name: Validate dashboard JSON
+        run: jq . grafana/provisioning/dashboards/decision-mode-traces.json > /dev/null
 
       - name: Validate Docker Compose config
         run: |
+          # Includes every var docker-compose.yml references without a :-/:?
+          # default. Any new var added to compose must be mirrored here, or the
+          # "unset variable" guard below fails the job.
           cat > .env.ci <<'EOF'
           AXONFLOW_REGISTRY=ghcr.io/getaxonflow
           AGENT_DIGEST=sha256:0000000000000000000000000000000000000000000000000000000000000000
@@ -28,14 +65,26 @@ jobs:
           PORTAL_UI_DIGEST=sha256:0000000000000000000000000000000000000000000000000000000000000000
           PROMETHEUS_DIGEST=sha256:0000000000000000000000000000000000000000000000000000000000000000
           GRAFANA_DIGEST=sha256:0000000000000000000000000000000000000000000000000000000000000000
-          AXONFLOW_VERSION=8.4.0
+          AXONFLOW_VERSION=0.0.0-ci
           AXONFLOW_DB_PASSWORD=ci-password
           AXONFLOW_ORG_ID=ci-org
           AXONFLOW_LICENSE_KEY=ci-license
+          AXONFLOW_INTERNAL_SERVICE_SECRET=ci-internal-service-secret
+          AXONFLOW_JWT_SECRET=ci-jwt-secret
+          AXONFLOW_PORTAL_ADMIN_PASSWORD=ci-portal-admin-password
           OPENAI_API_KEY=
           ANTHROPIC_API_KEY=
           GOOGLE_API_KEY=
           PII_ACTION=block
           GRAFANA_ADMIN_PASSWORD=ci-grafana-password
           EOF
+          # `docker compose config` warns-but-passes on unset vars. Capture the
+          # stderr warnings and fail the job if any variable is missing — a
+          # stale CI env must not silently greenlight a broken stack.
+          if WARN_OUT=$(docker compose --env-file .env.ci config 2>&1 1>/dev/null); then :; fi
+          if echo "$WARN_OUT" | grep -qi 'variable is not set'; then
+            echo "FAIL: docker compose config warned about unset variables:"
+            echo "$WARN_OUT"
+            exit 1
+          fi
           docker compose --env-file .env.ci config --quiet
