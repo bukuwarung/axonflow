@@ -180,7 +180,7 @@ Metadata:
 Parameters:
   PricingTier:
     Type: String
-    Description: Select your AxonFlow pricing tier
+    Description: Select your AxonFlow pricing tier (short alias or long form)
     AllowedValues:
       - PRO
       - Professional
@@ -188,9 +188,8 @@ Parameters:
       - Enterprise
       - PLUS
       - EnterprisePlus
-      - EnterprisePlus
     Default: Professional
-    ConstraintDescription: Must be Professional, Enterprise, or EnterprisePlus
+    ConstraintDescription: Must be PRO/Professional, ENT/Enterprise, or PLUS/EnterprisePlus
 
   AlbIdleTimeoutSeconds:
     Type: Number
@@ -260,8 +259,13 @@ Parameters:
     Type: String
     NoEcho: true
     MinLength: 16
-    Description: PostgreSQL master password (min 16 characters)
-    ConstraintDescription: Must be at least 16 characters
+    # Excludes `"` and `\` so the value can be safely substituted into the
+    # DBPasswordSecret JSON blob (SecretString) without corrupting the JSON
+    # and breaking the Secrets Manager `::password::` key lookup in every
+    # service's task definition.
+    AllowedPattern: '^[A-Za-z0-9!@#$%^&*()_+\-={}\[\]:;,.<>?/|~`'''']{16,128}$'
+    Description: PostgreSQL master password (min 16 characters; no `"` or `\`)
+    ConstraintDescription: 16-128 chars; letters, digits, and the symbols !@#$%^&*()_+-={}[]:;,.<>?/|~` only (no " or \)
 
   GrafanaPassword:
     Type: String
@@ -1040,6 +1044,27 @@ Parameters:
     Default: ''
 
 Rules:
+  # Refuse the placeholder GrafanaPassword default when Grafana is deployed.
+  # The default `not-deployed-change-if-enabling-grafana` is a known public
+  # string — leaving it set would ship Grafana admin + Grafana→RDS auth with
+  # a well-known password, reachable from anything on the ALB.
+  GrafanaPasswordNotPlaceholder:
+    RuleCondition: !Equals [!Ref DeployGrafana, 'true']
+    Assertions:
+      - Assert: !Not [!Equals [!Ref GrafanaPassword, 'not-deployed-change-if-enabling-grafana']]
+        AssertDescription: "GrafanaPassword must be set to a real value when DeployGrafana=true (the default placeholder is a well-known string and would ship Grafana with a public admin password)"
+
+  # Close the "silent prod-grade hole" the customer-portal task-def comment
+  # calls out: the admin-auth middleware only engages when DeploymentMode=saas
+  # AND ENVIRONMENT=production. Deploying in SaaS mode with EnvironmentType
+  # defaulted to 'staging' leaves /api/v1/admin/* unauthenticated. Force the
+  # pair to match at change-set time.
+  SaaSRequiresProductionEnvironment:
+    RuleCondition: !Equals [!Ref DeploymentMode, 'saas']
+    Assertions:
+      - Assert: !Equals [!Ref EnvironmentType, 'production']
+        AssertDescription: "EnvironmentType must be 'production' when DeploymentMode=saas, so the customer-portal admin-auth middleware (gated on ENVIRONMENT=production) engages on /api/v1/admin/* endpoints."
+
   # Validate Azure OpenAI credentials are complete
   # Note: Can't validate Google/OpenAI/Anthropic API keys when provider is enabled because
   # CloudFormation Rules don't support Fn::Split/Select/Join functions needed to parse EnabledLLMProviders list
@@ -1268,6 +1293,13 @@ Resources:
     Properties:
       GroupDescription: Security group for AxonFlow Application Load Balancer
       VpcId: !Ref VpcId
+      # Admin plane (orchestrator :8081, portal admin API :8090) is only
+      # opened when LoadBalancerScheme=internal — an internal ALB sits in
+      # private subnets, so 0.0.0.0/0 here effectively means VPC-reachable.
+      # For an internet-facing ALB we omit these rules entirely — admin
+      # access must then come through the internal ALB, a bastion, or an
+      # explicit SG rule added out-of-band. Port 3000 (portal UI) stays
+      # open because users reach the UI directly.
       SecurityGroupIngress:
         - IpProtocol: tcp
           FromPort: 443
@@ -1279,16 +1311,22 @@ Resources:
           ToPort: 80
           CidrIp: 0.0.0.0/0
           Description: HTTP from internet (redirect to HTTPS)
-        - IpProtocol: tcp
-          FromPort: 8081
-          ToPort: 8081
-          CidrIp: 0.0.0.0/0
-          Description: Orchestrator API from internet
-        - IpProtocol: tcp
-          FromPort: 8090
-          ToPort: 8090
-          CidrIp: 0.0.0.0/0
-          Description: Customer Portal API from internet
+        - !If
+          - IsInternalALB
+          - IpProtocol: tcp
+            FromPort: 8081
+            ToPort: 8081
+            CidrIp: 0.0.0.0/0
+            Description: Orchestrator API (reachable only via the internal ALB — VPC-local)
+          - !Ref AWS::NoValue
+        - !If
+          - IsInternalALB
+          - IpProtocol: tcp
+            FromPort: 8090
+            ToPort: 8090
+            CidrIp: 0.0.0.0/0
+            Description: Customer Portal admin API (reachable only via the internal ALB — VPC-local)
+          - !Ref AWS::NoValue
         - IpProtocol: tcp
           FromPort: 3000
           ToPort: 3000
@@ -3875,6 +3913,7 @@ Resources:
             - !Ref PrometheusSecurityGroup
           Subnets:
             - !Ref PublicSubnet1
+            - !Ref PublicSubnet2
       LoadBalancers:
         - ContainerName: prometheus
           ContainerPort: 9090
@@ -4081,6 +4120,7 @@ Resources:
             - !Ref GrafanaSecurityGroup
           Subnets:
             - !Ref PublicSubnet1
+            - !Ref PublicSubnet2
       LoadBalancers:
         - ContainerName: grafana
           ContainerPort: 3000
