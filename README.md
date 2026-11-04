@@ -40,17 +40,20 @@ Open `.env` and fill in the values from your welcome bundle:
 - Paste the 6 image digests matching your chosen registry
 - Set your database and Grafana passwords
 - Set your organization ID and license key
+- Generate `AXONFLOW_INTERNAL_SERVICE_SECRET` and `AXONFLOW_JWT_SECRET` (each: `openssl rand -hex 32`) — `install.sh` requires both
 - Set `AXONFLOW_PORTAL_ADMIN_PASSWORD` — your Customer Portal login password
 - Add at least one LLM provider API key
 
 ### 3. Install
 
 ```bash
-chmod +x install.sh verify.sh reset-portal-credential.sh
+chmod +x install.sh verify.sh smoke.sh reset-portal-credential.sh
 ./install.sh
 ```
 
 The install script validates your configuration, pulls images, starts all services, and runs a health check. The full process takes 2-5 minutes depending on your network speed.
+
+Once the stack is up, `./smoke.sh` runs the full end-to-end auth path (token mint → pre-check → decide → portal login → fail-closed gate) in one command.
 
 ### 4. Verify
 
@@ -138,9 +141,10 @@ docker compose down -v
 
 ## Upgrading
 
-To move to a new AxonFlow release, swap the image digest set in your `.env` and
-restart — there is no reinstall and your data is preserved. See
-**[UPGRADING.md](UPGRADING.md)** for the step-by-step guide.
+To move to a new AxonFlow release, swap the image digest set **and
+`AXONFLOW_VERSION`** in your `.env`, then restart — there is no reinstall and
+your data is preserved. See **[UPGRADING.md](UPGRADING.md)** for the
+step-by-step guide.
 
 ## Troubleshooting
 

@@ -21,9 +21,15 @@ GitHub Container Registry (GHCR) using the credentials in your welcome bundle.
 ## Prerequisites
 
 - **A VPC** with:
-  - **2 public subnets** in 2 Availability Zones (for the load balancer), each
-    routing `0.0.0.0/0` to an Internet Gateway.
-  - **2 private subnets** in the same 2 AZs (for the app services and RDS).
+  - **2 public subnets** in 2 Availability Zones — these host the Application
+    Load Balancer **and** the ECS Fargate tasks (the tasks are assigned public
+    IPs so they can pull images from ECR without VPC endpoints). Each routes
+    `0.0.0.0/0` to an Internet Gateway.
+  - **2 private subnets** in the same 2 AZs — these host the RDS database only.
+    Each routes `0.0.0.0/0` to a NAT Gateway (see next bullet).
+  - **At least 1 NAT Gateway** (2 for HA — one per AZ) attached to the public
+    subnets, so the private subnets can reach RDS maintenance/update
+    endpoints. Cost: ~$32/month per NAT Gateway (~$64/month for the HA setup).
 - **AWS CLI v2** and **Docker (with buildx)**, both authenticated to your
   account.
 - **GHCR pull credentials** from your welcome bundle:
@@ -119,6 +125,7 @@ Then deploy with:
 | `DeploymentMode` | `in-vpc-enterprise` (default, single-tenant in your VPC) — also enables the portal admin bootstrap. |
 | `CustomerPortalDesiredCount`, `CustomerPortalUIDesiredCount` | The governance console. Deployed by default (`1`); set to `0` only if you do not want the console. |
 | `DeployPrometheus`, `DeployGrafana` | Optional monitoring. |
+| `GrafanaPassword` | **Required** when `DeployGrafana=true` (the default). 16+ characters. Do not leave at the placeholder default shipped in the template — the Grafana target group is reachable from anything in the VPC via the ALB. |
 | `LoadBalancerScheme` | `internal` (default) or `internet-facing`. |
 | `DomainName` / `CertificateArn` | Optional HTTPS. |
 
@@ -147,6 +154,7 @@ aws cloudformation create-stack \
     ParameterKey=PrivateSubnet1,ParameterValue=subnet-cccc \
     ParameterKey=PrivateSubnet2,ParameterValue=subnet-dddd \
     ParameterKey=DBPassword,ParameterValue='ChangeMe-Strong-Passw0rd!' \
+    ParameterKey=GrafanaPassword,ParameterValue='ChangeMe-Strong-Grafana-Passw0rd!' \
     ParameterKey=ContainerImageRegistry,ParameterValue=ghcr.io/getaxonflow \
     ParameterKey=RegistryCredentialsSecretArn,ParameterValue=arn:aws:secretsmanager:us-east-1:123456789012:secret:axonflow/ghcr-pull-XXXX
 
@@ -247,6 +255,17 @@ tags (and `RegistryCredentialsSecretArn` unchanged).
 > default and can silently flip an existing stack's mode.
 
 ---
+
+## Known limitations
+
+- **`Custom::LicenseKeyGenerator` Lambda depends on an AxonFlow-controlled
+  secret.** The Lambda fetches an Ed25519 signing key from
+  `axonflow/license-signing/enterprise-private-key` in `us-east-1` of the
+  deploying account. Partner self-deploys that do not provision this secret
+  out-of-band will see the custom resource fail (`ResourceNotFoundException`)
+  and the stack roll back on first `create-stack`. If this applies to you,
+  contact support@getaxonflow.com for either a signing-key provisioning
+  bundle or a license-override variant of the template.
 
 ## Licensing
 

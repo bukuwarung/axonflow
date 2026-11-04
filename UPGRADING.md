@@ -51,8 +51,13 @@ is preserved.
 ## Rollback
 
 Re-pin the previous version's six digests and `AXONFLOW_VERSION` in `.env`, then
-`docker compose up -d`. Images are content-addressed by digest, so the image
-rollback is exact. This is safe for an **additive patch** release. A **minor or
+`docker compose up -d`. The AxonFlow images are content-addressed by digest, so
+their rollback is exact. Supporting images (`postgres`, `redis`,
+`otel/opentelemetry-collector-contrib`, `grafana/tempo`) are pinned by tag in
+`docker-compose.yml` and may float within that tag across upgrades — note this
+if you need a bit-for-bit rollback.
+
+Rollback this way is safe for an **additive patch** release. A **minor or
 major** release may run forward database migrations that are not automatically
 reversed — contact support@getaxonflow.com before rolling one of those back.
 
