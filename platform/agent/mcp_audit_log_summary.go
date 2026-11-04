@@ -46,8 +46,9 @@ type mcpAuditLogSummary struct {
 	redacted   int
 	exfil      int
 	connectors map[string]int
-	// otherConnectors counts entries whose connector name arrived once the
-	// map was full.
+	// otherConnectors counts entries without a count of their own: names over
+	// mcpAuditLogMaxNameLen bytes, and names that arrived once the map was
+	// full.
 	otherConnectors int
 }
 
