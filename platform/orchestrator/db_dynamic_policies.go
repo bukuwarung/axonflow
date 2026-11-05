@@ -504,11 +504,16 @@ func (e *DatabaseDynamicPolicyEngine) refreshPolicies() error {
 
 	// Update cache
 	e.mu.Lock()
+	prevCount := len(e.policies)
 	e.policies = newPolicies
 	e.lastRefresh = time.Now()
 	e.mu.Unlock()
 
-	log.Printf("Loaded %d policies from database", len(newPolicies))
+	// Only log when the count changes — the refresh fires every ~30s, and a
+	// steady "Loaded 17 policies" every half-minute is pure Datadog noise.
+	if len(newPolicies) != prevCount {
+		log.Printf("Loaded %d policies from database (was %d)", len(newPolicies), prevCount)
+	}
 	return nil
 }
 
@@ -555,6 +560,13 @@ func (e *DatabaseDynamicPolicyEngine) reportMetrics() {
 	ticker := time.NewTicker(10 * time.Second)
 	defer ticker.Stop()
 
+	// The policy_metrics system-health row keeps its 10s cadence (that's the
+	// SLO signal). The health LOG line only fires every 5 min, or on the next
+	// tick after state actually changes.
+	const healthLogInterval = 5 * time.Minute
+	var lastLoggedCount int
+	var lastLoggedAt time.Time
+
 	for {
 		select {
 		case <-e.stopCh:
@@ -599,12 +611,19 @@ func (e *DatabaseDynamicPolicyEngine) reportMetrics() {
 			log.Printf("Failed to report metrics: %v", wrapErr)
 		}
 
-		// Log health status
-		if lastRefresh.IsZero() {
+		// Log health status: on every tick while never-refreshed (that's a real
+		// signal), otherwise rate-limited to 5m — or sooner if the policy count
+		// moved since the last log.
+		switch {
+		case lastRefresh.IsZero():
 			log.Printf("Policy engine health: %d policies loaded, never refreshed", policyCount)
-		} else {
+			lastLoggedCount = policyCount
+			lastLoggedAt = time.Now()
+		case policyCount != lastLoggedCount || time.Since(lastLoggedAt) >= healthLogInterval:
 			log.Printf("Policy engine health: %d policies loaded, last refresh: %v ago",
 				policyCount, timeSinceRefresh)
+			lastLoggedCount = policyCount
+			lastLoggedAt = time.Now()
 		}
 	}
 }
