@@ -20,7 +20,6 @@ import (
 	"fmt"
 	"log"
 	"os"
-	"strings"
 	"sync"
 	"time"
 
@@ -264,34 +263,23 @@ func validateViaAPIKeys(ctx context.Context, db *sql.DB, clientID, clientSecret 
 
 // validateViaOrganizations validates using organizations table (new customer portal path)
 func validateViaOrganizations(ctx context.Context, db *sql.DB, clientID, clientSecret string) (*Client, error) {
-	// Debug: Log client secret format detection
-	isEd25519Format := len(clientSecret) > 5 && clientSecret[:5] == "AXON-" && strings.Contains(clientSecret[5:], ".")
-	log.Printf("[LICENSE-DEBUG] validateViaOrganizations: clientID=%s, isEd25519=%v, secretLen=%d, secretPrefix=%s",
-		logutil.Sanitize(clientID), isEd25519Format, len(clientSecret), logutil.MaskSecret(clientSecret, 10))
-
 	// First, validate the license key format cryptographically
 	validationResult, err := validateLicenseFn(ctx, clientSecret)
 	if err != nil {
-		log.Printf("[LICENSE-DEBUG] License validation ERROR: %v", err)
+		log.Printf("license validation error for clientID=%s: %v", logutil.Sanitize(clientID), err)
 		return nil, fmt.Errorf("license validation failed: %w", err)
 	}
 
 	if !validationResult.Valid && !acceptExpiredClientKey(validationResult) {
-		log.Printf("[LICENSE-DEBUG] License INVALID: %s", logutil.Sanitize(validationResult.Error))
+		log.Printf("license invalid for clientID=%s: %s", logutil.Sanitize(clientID), logutil.Sanitize(validationResult.Error))
 		return nil, fmt.Errorf("license invalid or expired: %s", validationResult.Error)
 	}
-
-	// Debug: Log validation result
-	log.Printf("[LICENSE-DEBUG] License validation SUCCESS: ServiceName='%s', Tier='%s', OrgID='%s', Perms=%v",
-		validationResult.ServiceName, validationResult.Tier, validationResult.OrgID, validationResult.Permissions)
 
 	// Extract org_id from validated license
 	orgID := validationResult.OrgID
 
 	// Detect if this is a service license (has service_name in payload)
 	isServiceLicense := len(validationResult.ServiceName) > 0
-	log.Printf("[LICENSE-DEBUG] Service license check: isServiceLicense=%v (ServiceName len=%d)",
-		isServiceLicense, len(validationResult.ServiceName))
 
 	// Service licenses are self-contained - the Ed25519 signature validates
 	// all claims (tenant_id, tier, permissions, expiry). No database lookup needed.

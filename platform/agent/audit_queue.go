@@ -467,13 +467,25 @@ func (aq *AuditQueue) metricsBatcher() {
 	ticker := time.NewTicker(time.Second)
 	defer ticker.Stop()
 
+	// Roll per-flush activity up into one line every 5 minutes instead of one
+	// per flush — a 1s flush cadence times two tasks turns into ~57k log lines
+	// per 8h otherwise.
+	summary := time.NewTicker(5 * time.Minute)
+	defer summary.Stop()
+	var flushCount, metricsFlushed uint64
+
 	for {
 		select {
 		case entry, ok := <-aq.metricsBatch:
 			if !ok {
 				// Channel closed - flush remaining batch and exit
 				if len(batch) > 0 {
-					aq.flushMetricsBatch(batch)
+					n := aq.flushMetricsBatch(batch)
+					flushCount++
+					metricsFlushed += uint64(n)
+				}
+				if flushCount > 0 {
+					log.Printf("audit queue: flushed %d metrics in %d flushes before shutdown", metricsFlushed, flushCount)
 				}
 				return
 			}
@@ -482,24 +494,35 @@ func (aq *AuditQueue) metricsBatcher() {
 
 			// Flush if batch is full
 			if len(batch) >= 100 {
-				aq.flushMetricsBatch(batch)
+				n := aq.flushMetricsBatch(batch)
+				flushCount++
+				metricsFlushed += uint64(n)
 				batch = batch[:0]
 			}
 
 		case <-ticker.C:
 			// Periodic flush
 			if len(batch) > 0 {
-				aq.flushMetricsBatch(batch)
+				n := aq.flushMetricsBatch(batch)
+				flushCount++
+				metricsFlushed += uint64(n)
 				batch = batch[:0]
+			}
+
+		case <-summary.C:
+			if flushCount > 0 {
+				log.Printf("audit queue: flushed %d metrics in %d flushes over last 5m", metricsFlushed, flushCount)
+				flushCount, metricsFlushed = 0, 0
 			}
 		}
 	}
 }
 
-// flushMetricsBatch writes a batch of metrics to the database
-func (aq *AuditQueue) flushMetricsBatch(batch []AuditEntry) {
+// flushMetricsBatch writes a batch of metrics to the database. Returns the
+// batch size the caller can roll into its periodic summary log.
+func (aq *AuditQueue) flushMetricsBatch(batch []AuditEntry) int {
 	if aq.db == nil || len(batch) == 0 {
-		return
+		return 0
 	}
 
 	// Batch INSERT for metrics (policy hit counts)
@@ -540,7 +563,7 @@ func (aq *AuditQueue) flushMetricsBatch(batch []AuditEntry) {
 	}
 
 	atomic.AddUint64(&aq.processed, uint64(len(batch)))
-	log.Printf("Flushed %d metrics to database", len(batch))
+	return len(batch)
 }
 
 // writeToDBSync writes synchronously to database (for compliance mode)
